@@ -31,20 +31,23 @@ import java.util.ArrayList;
 import java.util.Collection;
 import java.util.List;
 import java.util.logging.Level;
+import java.util.logging.Logger;
 
 import org.jboss.netty.bootstrap.ServerBootstrap;
 import org.jboss.netty.channel.Channel;
 import org.jboss.netty.channel.ChannelFactory;
 import org.jboss.netty.channel.ChannelPipelineFactory;
 import org.jboss.netty.channel.socket.nio.NioServerSocketChannelFactory;
+
 import org.spout.api.Server;
 import org.spout.api.Spout;
-import org.spout.api.event.Listener;
 import org.spout.api.plugin.Platform;
 import org.spout.api.protocol.CommonPipelineFactory;
 import org.spout.api.protocol.Session;
 import org.spout.api.protocol.bootstrap.BootstrapProtocol;
+
 import org.spout.engine.filesystem.ServerFileSystem;
+import org.spout.engine.filesystem.SharedFileSystem;
 import org.spout.engine.listener.SpoutListener;
 import org.spout.engine.protocol.SpoutSession;
 import org.spout.engine.util.bans.BanManager;
@@ -88,25 +91,15 @@ public class SpoutServer extends SpoutEngine implements Server {
 		new JCommander(server, args);
 		server.init(args);
 		server.start();
-		
 	}
 
+	@Override
 	public void start() {
-		start(true);
-	}
-	
-	public void start(boolean checkWorlds) {
-		start(checkWorlds, new SpoutListener(this));
-	}
-		
-	public void start(boolean checkWorlds, Listener listener) {
-		super.start(checkWorlds);
+		super.start();
 		
 		banManager = new FlatFileBanManager(this);
 
-		getEventManager().registerEvents(listener, this);
-		
-		Spout.getFilesystem().postStartup();
+		getEventManager().registerEvents(new SpoutListener(this), this);
 
 		getLogger().info("Done Loading, ready for players.");
 	}
@@ -117,7 +110,7 @@ public class SpoutServer extends SpoutEngine implements Server {
 		ChannelFactory factory = new NioServerSocketChannelFactory(executor, executor);
 		bootstrap.setFactory(factory);
 
-		ChannelPipelineFactory pipelineFactory = new CommonPipelineFactory(this, false);
+		ChannelPipelineFactory pipelineFactory = new CommonPipelineFactory(this);
 		bootstrap.setPipelineFactory(pipelineFactory);
 	}
 

@@ -37,9 +37,8 @@ import java.util.concurrent.atomic.AtomicReference;
 import java.util.logging.Level;
 
 import org.jboss.netty.channel.Channel;
-import org.jboss.netty.channel.ChannelFuture;
 import org.jboss.netty.channel.ChannelFutureListener;
-import org.jboss.netty.channel.ChannelPipeline;
+
 import org.spout.api.ChatColor;
 import org.spout.api.Engine;
 import org.spout.api.Spout;
@@ -58,6 +57,7 @@ import org.spout.api.protocol.NullNetworkSynchronizer;
 import org.spout.api.protocol.Protocol;
 import org.spout.api.protocol.Session;
 import org.spout.api.protocol.bootstrap.BootstrapProtocol;
+
 import org.spout.engine.SpoutServer;
 import org.spout.engine.player.SpoutPlayer;
 import org.spout.engine.world.SpoutWorld;
@@ -205,7 +205,7 @@ public final class SpoutSession implements Session {
 		}
 
 		while ((message = messageQueue.poll()) != null) {
-			MessageHandler<Message> handler = (MessageHandler<Message>) protocol.get().getHandlerLookupService(false).find(message.getClass());
+			MessageHandler<Message> handler = (MessageHandler<Message>) protocol.get().getHandlerLookupService().find(message.getClass());
 			if (handler != null) {
 				try {
 					handler.handle(this, player, message);
@@ -261,11 +261,7 @@ public final class SpoutSession implements Session {
 	}
 
 	public String getDefaultLeaveMessage() {
-		if (player == null) {
-			return ChatColor.CYAN + "Unknown" + ChatColor.CYAN + " has left the game";
-		} else {
-			return ChatColor.CYAN + player.getDisplayName() + ChatColor.CYAN + " has left the game";
-		}
+		return ChatColor.CYAN + player.getDisplayName() + ChatColor.CYAN + " has left the game";
 	}
 
 	@Override
@@ -284,11 +280,7 @@ public final class SpoutSession implements Session {
 			}
 			dispose(event);
 		}
-		Protocol protocol = getProtocol();
-		Message kickMessage = null;
-		if (protocol != null) {
-			kickMessage = protocol.getKickMessage(reason);
-		}
+		Message kickMessage = getNetworkSynchronizer().getKickMessage(reason);
 		if (kickMessage != null) {
 			channel.write(kickMessage).addListener(ChannelFutureListener.CLOSE);
 		} else {
@@ -389,13 +381,8 @@ public final class SpoutSession implements Session {
 		if (!this.protocol.compareAndSet(bootstrapProtocol, protocol)) {
 			throw new IllegalArgumentException("The protocol may only be set once per session");
 		}
-		this.synchronizer.get().setProtocol(protocol);
+
 		server.getLogger().info("Setting protocol to " + protocol.getName());
-	}
-	
-	@Override
-	public Protocol getProtocol() {
-		return this.protocol.get();
 	}
 
 	@Override
@@ -419,8 +406,6 @@ public final class SpoutSession implements Session {
 			this.synchronizer.set(nullSynchronizer);
 		} else if (!this.synchronizer.compareAndSet(nullSynchronizer, synchronizer)) {
 			throw new IllegalArgumentException("Network synchronizer may only be set once for a given player login");
-		} else {
-			synchronizer.setProtocol(protocol.get());
 		}
 	}
 
