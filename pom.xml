@@ -5,14 +5,14 @@
 	<name>Spout</name>
 	<groupId>org.spout</groupId>
 	<artifactId>spout</artifactId>
-	<version>dev-SNAPSHOT</version>
+	<version>0.1.1-SNAPSHOT</version>
 	<url>http://www.spout.org</url>
 	<inceptionYear>2011</inceptionYear>
 	<description>Spout is an open-source implementation of the Minecraft server software written in Java, originally forked from the Glowstone project.</description>
 
 	<properties>
 		<project.build.sourceEncoding>UTF-8</project.build.sourceEncoding>
-		<apiVersion>dev-SNAPSHOT</apiVersion>
+		<apiVersion>0.1.1-SNAPSHOT</apiVersion>
 		<lwjglVersion>2.8.3</lwjglVersion>
 		<buildNumber>0</buildNumber>
 	</properties>
