@@ -36,17 +36,23 @@ import org.spout.api.datatable.DataMap;
 import org.spout.api.datatable.DatatableMap;
 import org.spout.api.generator.biome.BiomeManager;
 import org.spout.api.geo.cuboid.ChunkSnapshot;
+import org.spout.api.geo.cuboid.ChunkSnapshot.EntityType;
+import org.spout.api.geo.cuboid.ChunkSnapshot.ExtraData;
+import org.spout.api.geo.cuboid.ChunkSnapshot.SnapshotType;
 import org.spout.api.material.BlockMaterial;
 import org.spout.api.material.Material;
 import org.spout.api.material.block.BlockFullState;
 import org.spout.api.math.Vector3;
 import org.spout.api.util.map.concurrent.AtomicBlockStoreImpl;
-import org.spout.engine.filesystem.WorldFiles;
 
 public class FilteredChunk extends SpoutChunk{
 	private final AtomicBoolean uniform;
 	private final AtomicInteger uniformId = new AtomicInteger(0);
 	private final AtomicReference<BlockMaterial> material = new AtomicReference<BlockMaterial>(null);
+	/**
+	 * Keeps track if the chunk has been modified since it's last save
+	 */
+	private final AtomicBoolean chunkModified = new AtomicBoolean(false);
 
 	protected final static byte[] DARK = new byte[BLOCKS.HALF_VOLUME];
 	protected final static byte[] LIGHT = new byte[BLOCKS.HALF_VOLUME];
@@ -56,11 +62,12 @@ public class FilteredChunk extends SpoutChunk{
 	}
 
 	public FilteredChunk(SpoutWorld world, SpoutRegion region, float x, float y, float z, short[] initial, BiomeManager manager, DataMap map) {
-		this(world, region, x, y, z, false, initial, null, null, null, manager, map.getRawMap());
+		this(world, region, x, y, z, PopulationState.UNTOUCHED, initial, null, null, null, manager, map.getRawMap());
+		chunkModified.set(true);
 	}
 
-	public FilteredChunk(SpoutWorld world, SpoutRegion region, float x, float y, float z, boolean populated, short[] blocks, short[] data, byte[] skyLight, byte[] blockLight, BiomeManager manager, DatatableMap extraData) {
-		super(world, region, x, y, z, populated, blocks, data, skyLight, blockLight, manager, extraData);
+	public FilteredChunk(SpoutWorld world, SpoutRegion region, float x, float y, float z, PopulationState popState, short[] blocks, short[] data, byte[] skyLight, byte[] blockLight, BiomeManager manager, DatatableMap extraData) {
+		super(world, region, x, y, z, popState, blocks, data, skyLight, blockLight, manager, extraData);
 
 		uniform = new AtomicBoolean(true);
 		short id = blocks[0];
@@ -112,6 +119,7 @@ public class FilteredChunk extends SpoutChunk{
 		if (uniform.get()) {
 			initialize();
 		}
+		chunkModified.set(true);
 		return super.setBlockData(x, y, z, data, source);
 	}
 
@@ -163,6 +171,7 @@ public class FilteredChunk extends SpoutChunk{
 		if (uniform.get()) {
 			initialize();
 		}
+		chunkModified.set(true);
 		return super.setBlockDataFieldRaw(bx, by, bz, bits, value, source);
 	}
 
@@ -176,6 +185,7 @@ public class FilteredChunk extends SpoutChunk{
 				return false;
 			}
 		}
+		chunkModified.set(true);
 		return super.compareAndSetData(x, y, z, expect, data, source);
 	}
 
@@ -184,6 +194,7 @@ public class FilteredChunk extends SpoutChunk{
 		if (uniform.get()) {
 			return false;
 		}
+		chunkModified.set(true);
 		return super.setBlockLight(x, y, z, light, source);
 	}
 
@@ -192,15 +203,24 @@ public class FilteredChunk extends SpoutChunk{
 		if (uniform.get()) {
 			return false;
 		}
+		chunkModified.set(true);
 		return super.setBlockSkyLight(x, y, z, light, source);
 	}
 
 	@Override
 	public byte getBlockSkyLight(int x, int y, int z) {
 		if (uniform.get()) {
-			return this.isAboveGround() ? (byte) 0xF : (byte) 0x0;
+			return this.isAboveGround() ? getWorld().getSkyLight() : (byte) 0x0;
 		}
 		return super.getBlockSkyLight(x, y, z);
+	}
+
+	@Override
+	public byte getBlockSkyLightRaw(int x, int y, int z) {
+		if (uniform.get()) {
+			return this.isAboveGround() ? (byte) 0xF : (byte) 0x0;
+		}
+		return super.getBlockSkyLightRaw(x, y, z);
 	}
 
 	@Override
@@ -217,38 +237,59 @@ public class FilteredChunk extends SpoutChunk{
 			super.initLighting();
 		}
 	}
-
+	
 	@Override
 	public void syncSave() {
-		if (uniform.get()) {
-			short[] initial = new short[BLOCKS.VOLUME];
-			short id = (short)uniformId.get();
-			for (int i = 0; i < initial.length; i++) {
-				initial[i] = id;
-			}
-			WorldFiles.saveChunk(this, initial, new short[BLOCKS.VOLUME], this.getY() < 4 ? DARK : LIGHT, DARK, datatableMap, this.parentRegion.getChunkOutputStream(this));
-		} else {
+		if (this.chunkModified.compareAndSet(true, false)) {
 			super.syncSave();
+		} else {
+			//System.out.println("Cancelling save of " + toString() + " no modifications");
 		}
 	}
 
 	@Override
-	public ChunkSnapshot getSnapshot(boolean entities) {
+	public ChunkSnapshot getSnapshot(SnapshotType type, EntityType entities, ExtraData data) {
 		if (uniform.get()) {
-			short[] initial = new short[BLOCKS.VOLUME];
-			short id = (short)uniformId.get();
-			for (int i = 0; i < initial.length; i++) {
-				initial[i] = id;
+			byte[] blockLightCopy = null, skyLightCopy = null;
+			short[] blockIds = null, blockData = null;
+			switch(type) {
+				case NO_BLOCK_DATA: break;
+				case BLOCK_IDS_ONLY: 
+					blockIds = uniformBlockIds();
+					break;
+				case BLOCKS_ONLY: 
+					blockIds = uniformBlockIds();
+					blockData = new short[BLOCKS.VOLUME];
+					break;
+				case LIGHT_ONLY: 
+					blockLightCopy = new byte[BLOCKS.VOLUME / 2];
+					System.arraycopy(DARK, 0, blockLightCopy, 0, blockLightCopy.length);
+					skyLightCopy = new byte[BLOCKS.VOLUME / 2];
+					System.arraycopy(this.getY() < 4 ? DARK : LIGHT, 0, skyLightCopy, 0, skyLightCopy.length);
+					break;
+				case BOTH: 
+					blockIds = uniformBlockIds();
+					blockData = new short[BLOCKS.VOLUME];
+					
+					blockLightCopy = new byte[BLOCKS.VOLUME / 2];
+					System.arraycopy(DARK, 0, blockLightCopy, 0, blockLightCopy.length);
+					skyLightCopy = new byte[BLOCKS.VOLUME / 2];
+					System.arraycopy(this.getY() < 4 ? DARK : LIGHT, 0, skyLightCopy, 0, skyLightCopy.length);
+					break;
 			}
-
-			byte[] skyLight = new byte[BLOCKS.HALF_VOLUME];
-			System.arraycopy(this.getY() < 4 ? DARK : LIGHT, 0, skyLight, 0, skyLight.length);
-
-			byte[] blockLight = new byte[BLOCKS.HALF_VOLUME];
-			System.arraycopy(DARK, 0, blockLight, 0, blockLight.length);
-			return new SpoutChunkSnapshot(this, initial, new short[BLOCKS.VOLUME], blockLight, skyLight, entities);
+			
+			return new SpoutChunkSnapshot(this, blockIds, blockData, blockLightCopy, skyLightCopy, entities, data);
 		}
-		return super.getSnapshot(entities);
+		return super.getSnapshot(type, entities, data);
+	}
+	
+	private short[] uniformBlockIds() {
+		short[] initial = new short[BLOCKS.VOLUME];
+		short id = (short)uniformId.get();
+		for (int i = 0; i < initial.length; i++) {
+			initial[i] = id;
+		}
+		return initial;
 	}
 
 	@Override

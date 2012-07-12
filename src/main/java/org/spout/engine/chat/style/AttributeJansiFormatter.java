@@ -24,19 +24,33 @@
  * License and see <http://www.spout.org/SpoutDevLicenseV1.txt> for the full license,
  * including the MIT license.
  */
-package org.spout.engine.renderer.shader;
+package org.spout.engine.chat.style;
+
+import gnu.trove.map.hash.TIntObjectHashMap;
+import org.apache.commons.lang3.Validate;
+import org.fusesource.jansi.Ansi;
 
 /**
- * Empty Shader for 1.1 only.  Do not use this for 3.0 ever.
- * @author RoyAwesome
+ * @author zml2008
  */
-public class EmptyShader extends ClientShader {
-	public EmptyShader() {
-		super(null, null);
+public class AttributeJansiFormatter extends JansiStyleFormatter {
+	private static final TIntObjectHashMap<Ansi.Attribute> ATTRIBUTE_ID_MAP = new TIntObjectHashMap<Ansi.Attribute>();
+	static {
+		for (Ansi.Attribute attr : Ansi.Attribute.values()) {
+			ATTRIBUTE_ID_MAP.put(attr.value(), attr);
+		}
 	}
 
-	@Override
-	public void assign() {
-		return;
+	private final Ansi.Attribute enableAttribute;
+	private final Ansi.Attribute disableAttribute;
+
+	public AttributeJansiFormatter(Ansi.Attribute enableAttribute) {
+		this.enableAttribute = enableAttribute;
+		this.disableAttribute = ATTRIBUTE_ID_MAP.get(enableAttribute.value() + 20);
+		Validate.notNull(disableAttribute, "No corresponding disable attribute for " + enableAttribute);
+	}
+
+	public void format(Ansi ansi, String text) {
+		ansi.a(enableAttribute).a(text).a(disableAttribute);
 	}
 }

@@ -64,16 +64,13 @@ import org.spout.api.render.BasicCamera;
 import org.spout.api.render.Camera;
 import org.spout.api.render.RenderMaterial;
 import org.spout.api.render.RenderMode;
-import org.spout.api.render.Shader;
 import org.spout.api.render.Texture;
 import org.spout.api.util.map.TInt21TripleObjectHashMap;
 import org.spout.engine.batcher.PrimitiveBatch;
 import org.spout.engine.filesystem.ClientFileSystem;
-import org.spout.engine.filesystem.SharedFileSystem;
 import org.spout.engine.mesh.BaseMesh;
 import org.spout.engine.renderer.BatchVertexRenderer;
 import org.spout.engine.renderer.VertexBufferBatcher;
-import org.spout.engine.renderer.vertexbuffer.VertexBuffer;
 import org.spout.engine.renderer.vertexbuffer.VertexBufferImpl;
 import org.spout.engine.util.RenderModeConverter;
 import org.spout.engine.world.SpoutChunk;
@@ -295,27 +292,27 @@ public class SpoutClient extends SpoutEngine implements Client {
 		//renderer.end();
 		
 		//renderer.draw();
-/*
+
 	
 		textureTest.begin(material);
-		textureTest.getShader().setUniform("View", activeCamera.getView());
+		textureTest.getShader().setUniform("View", view);
 		textureTest.getShader().setUniform("Projection", activeCamera.getProjection());
 		textureTest.addTexCoord(0, 0);
-		textureTest.addVertex(0, 0);
+		textureTest.addVertex(4, 4);
 		textureTest.addTexCoord(1, 0);
-		textureTest.addVertex(1, 0);
+		textureTest.addVertex(5, 4);
 		textureTest.addTexCoord(0, 1);
-		textureTest.addVertex(0, 1);
+		textureTest.addVertex(4, 5);
 
 		textureTest.addTexCoord(0, 1);
-		textureTest.addVertex(0, 1);
+		textureTest.addVertex(4, 5);
 		textureTest.addTexCoord(1, 1);
-		textureTest.addVertex(1, 1);
+		textureTest.addVertex(5, 5);
 		textureTest.addTexCoord(1, 0);
-		textureTest.addVertex(1, 0);
+		textureTest.addVertex(5, 4);
 		textureTest.end();
 		textureTest.render();
-		*/
+		
 		/*
 		Object[] worlds = this.getLiveWorlds().toArray();
 		SpoutWorld world = (SpoutWorld)worlds[0];

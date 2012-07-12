@@ -56,9 +56,9 @@ import org.spout.api.model.Model;
 import org.spout.api.player.Player;
 import org.spout.api.tickable.Tickable;
 import org.spout.api.util.OutwardIterator;
+import org.spout.api.util.Profiler;
 import org.spout.engine.SpoutConfiguration;
 import org.spout.engine.SpoutEngine;
-import org.spout.engine.protocol.SpoutSession;
 import org.spout.engine.world.SpoutChunk;
 import org.spout.engine.world.SpoutRegion;
 
@@ -146,16 +146,11 @@ public class SpoutEntity extends Tickable implements Entity {
 
 	@Override
 	public void onTick(float dt) {
+		Profiler.start("tick entity session");
 		Controller cont = controllerLive.get();
-		//Pulse all player messages here, so they can interact with the entities position safely
-		if (cont instanceof PlayerController) {
-			Player player = ((PlayerController)cont).getPlayer();
-			if (player != null && player.getSession() != null) {
-				((SpoutSession) player.getSession()).pulse();
-			}
-		}
 
 		//Tick the controller
+		Profiler.startAndStop("tick entity controller");
 		if (cont != null) {
 			//Sanity check
 			if (cont.getParent() != this) {
@@ -181,11 +176,13 @@ public class SpoutEntity extends Tickable implements Entity {
 		 * Copy over live chunk and entity manager values if this entity is valid. Transform copying is handled in
 		 * resolve (Tick Stage 2Pre).
 		 */
+		Profiler.startAndStop("tick entity chunk");
 		if (!isDead() && getPosition() != null && getWorld() != null) {
 			//Note: if the chunk is null, this effectively kills the entity (since dead: {chunkLive.get() == null})
 			chunkLive.set(getWorld().getChunkFromBlock(transform.getPosition(), LoadOption.NO_LOAD));
 			entityManagerLive.set(((SpoutRegion)getRegion()).getEntityManager());
 		}
+		Profiler.stop();
 	}
 
 	/**
@@ -609,7 +606,7 @@ public class SpoutEntity extends Tickable implements Entity {
 		OutwardIterator oi = new OutwardIterator(cx, cy, cz, viewDistance);
 		while (oi.hasNext()) {
 			IntVector3 v = oi.next();
-			Chunk chunk = w.getChunk(v.getX(), v.getY(), v.getZ());
+			Chunk chunk = w.getChunk(v.getX(), v.getY(), v.getZ(), LoadOption.LOAD_GEN);
 			chunk.refreshObserver(this);
 			observing.add((SpoutChunk)chunk);
 		}

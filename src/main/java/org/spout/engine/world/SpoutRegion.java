@@ -64,21 +64,22 @@ import org.spout.api.geo.LoadOption;
 import org.spout.api.geo.World;
 import org.spout.api.geo.cuboid.Block;
 import org.spout.api.geo.cuboid.Chunk;
+import org.spout.api.geo.cuboid.ChunkSnapshot;
 import org.spout.api.geo.cuboid.Region;
 import org.spout.api.geo.discrete.Point;
 import org.spout.api.io.bytearrayarray.BAAWrapper;
 import org.spout.api.material.BlockMaterial;
 import org.spout.api.material.DynamicUpdateEntry;
 import org.spout.api.material.block.BlockFullState;
-import org.spout.api.material.range.EffectIterator;
 import org.spout.api.material.range.EffectRange;
-import org.spout.api.math.IntVector3;
 import org.spout.api.math.Vector3;
 import org.spout.api.player.Player;
 import org.spout.api.protocol.NetworkSynchronizer;
 import org.spout.api.scheduler.TaskManager;
+import org.spout.api.scheduler.TaskPriority;
 import org.spout.api.scheduler.TickStage;
 import org.spout.api.util.cuboid.CuboidShortBuffer;
+import org.spout.api.util.Profiler;
 import org.spout.api.util.set.TByteTripleHashSet;
 import org.spout.api.util.thread.DelayedWrite;
 import org.spout.api.util.thread.LiveRead;
@@ -115,7 +116,7 @@ public class SpoutRegion extends Region{
 	 * The maximum number of chunks that will be reaped by the chunk reaper each
 	 * tick.
 	 */
-	private static final int REAP_PER_TICK = 1;
+	private static final int REAP_PER_TICK = 3;
 	/**
 	 * The segment size to use for chunk storage. The actual size is
 	 * 2^(SEGMENT_SIZE)
@@ -149,7 +150,6 @@ public class SpoutRegion extends Region{
 
 	private final ConcurrentLinkedQueue<SpoutChunkSnapshotFuture> snapshotQueue = new ConcurrentLinkedQueue<SpoutChunkSnapshotFuture>();
 
-	private boolean isPopulatingChunks = false;
 	protected Queue<Chunk> unloadQueue = new ConcurrentLinkedQueue<Chunk>();
 	public static final byte POPULATE_CHUNK_MARGIN = 1;
 	/**
@@ -300,9 +300,7 @@ public class SpoutRegion extends Region{
 
 				Spout.getEventManager().callDelayedEvent(new ChunkLoadEvent(newChunk, generated));
 
-				if (!newChunk.isPopulated()) {
-					queueChunkForPopulation(newChunk);
-				}
+				getTaskManager().scheduleSyncDelayedTask(Spout.getEngine(), new RandomUpdateTask(newChunk), RandomUpdateTask.TICK_DELAY, TaskPriority.LOWEST);
 
 				return newChunk;
 			}
@@ -449,9 +447,13 @@ public class SpoutRegion extends Region{
 		}
 		markForSaveUnload();
 	}
-
+	
 	@Override
 	public void unload(boolean save) {
+		unload(save, false);
+	}
+
+	public void unload(boolean save, boolean force) {
 		for (int dx = 0; dx < CHUNKS.SIZE; dx++) {
 			for (int dy = 0; dy < CHUNKS.SIZE; dy++) {
 				for (int dz = 0; dz < CHUNKS.SIZE; dz++) {
@@ -461,6 +463,10 @@ public class SpoutRegion extends Region{
 					}
 				}
 			}
+		}
+		if (force) {
+			//Only should occur if the server is shutting down
+			copySnapshotRun();
 		}
 		markForSaveUnload();
 	}
@@ -594,102 +600,114 @@ public class SpoutRegion extends Region{
 		}
 		switch (stage) {
 			case 0: {
-				taskManager.heartbeat(delta);
-				float dt = delta / 1000.f;
-				//Update all entities
-				for (SpoutEntity ent : entityManager) {
-					try {
-						//Try and determine if we should tick this entity
-						//If the entity is not important (not an observer)
-						//And the entity is not visible to players, don't tick it
-						if (visibleToPlayers || (ent.getController() != null && ent.getController().isImportant())) {
-							ent.tick(dt);
-						}
-					} catch (Exception e) {
-						Spout.getEngine().getLogger().severe("Unhandled exception during tick for " + ent.toString());
-						e.printStackTrace();
-					}
-				}
-
-				//for those chunks that had lighting updated - refresh
-				synchronized (lightDirtyChunks) {
-					if (!lightDirtyChunks.isEmpty()) {
-						int key;
-						int x, y, z;
-						TIntIterator iter = lightDirtyChunks.iterator();
-						while (iter.hasNext()) {
-							key = iter.next();
-							x = TByteTripleHashSet.key1(key);
-							y = TByteTripleHashSet.key2(key);
-							z = TByteTripleHashSet.key3(key);
-							SpoutChunk chunk = this.getChunk(x, y, z);
-							if (chunk == null || !chunk.isLoaded()) {
-								iter.remove();
-								continue;
+				Profiler.start("startTickRun stage 1");
+				try {
+					taskManager.heartbeat(delta);
+					float dt = delta / 1000.f;
+					Profiler.start("tick entities");
+					//Update all entities
+					for (SpoutEntity ent : entityManager) {
+						try {
+							//Try and determine if we should tick this entity
+							//If the entity is not important (not an observer)
+							//And the entity is not visible to players, don't tick it
+							if (visibleToPlayers || (ent.getController() != null && ent.getController().isImportant())) {
+								ent.tick(dt);
 							}
-							if (chunk.lightingCounter.incrementAndGet() > LIGHT_SEND_TICK_DELAY) {
-								chunk.lightingCounter.set(-1);
-								if (SpoutConfiguration.LIVE_LIGHTING.getBoolean()) {
-									chunk.setLightDirty(true);
+						} catch (Exception e) {
+							Spout.getEngine().getLogger().severe("Unhandled exception during tick for " + ent.toString());
+							e.printStackTrace();
+						}
+					}
+					Profiler.startAndStop("lighting refresh");
+					//for those chunks that had lighting updated - refresh
+					synchronized (lightDirtyChunks) {
+						if (!lightDirtyChunks.isEmpty()) {
+							int key;
+							int x, y, z;
+							TIntIterator iter = lightDirtyChunks.iterator();
+							while (iter.hasNext()) {
+								key = iter.next();
+								x = TByteTripleHashSet.key1(key);
+								y = TByteTripleHashSet.key2(key);
+								z = TByteTripleHashSet.key3(key);
+								SpoutChunk chunk = this.getChunk(x, y, z, LoadOption.NO_LOAD);
+								if (chunk == null || !chunk.isLoaded()) {
+									iter.remove();
+									continue;
 								}
-								iter.remove();
+								if (chunk.lightingCounter.incrementAndGet() > LIGHT_SEND_TICK_DELAY) {
+									chunk.lightingCounter.set(-1);
+									if (SpoutConfiguration.LIVE_LIGHTING.getBoolean()) {
+										chunk.setLightDirty(true);
+									}
+									iter.remove();
+								}
 							}
 						}
 					}
-				}
-
-
-
-				for (int i = 0; i < POPULATE_PER_TICK; i++) {
-					Chunk toPopulate = populationQueue.poll();
-					if (toPopulate == null) {
-						break;
-					}
-					populationQueueSet.remove(toPopulate);
-					if (toPopulate.isLoaded()) {
-						toPopulate.populate();
-					} else {
-						i--;
-					}
-				}
-
-				Chunk toUnload = unloadQueue.poll();
-				if (toUnload != null) {
-					boolean do_unload = true;
-					if (ChunkUnloadEvent.getHandlerList().getRegisteredListeners().length > 0) {
-						ChunkUnloadEvent event = Spout.getEngine().getEventManager().callEvent(new ChunkUnloadEvent(toUnload));
-						if (event.isCancelled()) {
-							do_unload = false;
+					
+					Profiler.startAndStop("chunk population");
+					for (int i = 0; i < POPULATE_PER_TICK; i++) {
+						Chunk toPopulate = populationQueue.poll();
+						if (toPopulate == null) {
+							break;
+						}
+						populationQueueSet.remove(toPopulate);
+						if (toPopulate.isLoaded()) {
+							toPopulate.populate();
+						} else {
+							i--;
 						}
 					}
-					if (do_unload) {
-						toUnload.unload(true);
+	
+					Profiler.startAndStop("chunk unload");
+					Chunk toUnload = unloadQueue.poll();
+					if (toUnload != null) {
+						boolean do_unload = true;
+						if (ChunkUnloadEvent.getHandlerList().getRegisteredListeners().length > 0) {
+							ChunkUnloadEvent event = Spout.getEngine().getEventManager().callEvent(new ChunkUnloadEvent(toUnload));
+							if (event.isCancelled()) {
+								do_unload = false;
+							}
+						}
+						if (do_unload) {
+							toUnload.unload(true);
+						}
 					}
+					Profiler.stop();
+				} finally {
+					Profiler.stop();
 				}
-
 				break;
 			}
 			case 1: {
-				//Resolve collisions and prepare for a snapshot.
-				Set<SpoutEntity> resolvers = new HashSet<SpoutEntity>();
-				for (SpoutEntity ent : entityManager) {
-					//Try and determine if we should resolve collisions for this entity
-					//If the entity is not important (not an observer)
-					//And the entity is not visible to players, don't resolve it
-					if (visibleToPlayers || (ent.getController() != null && ent.getController().isImportant())) {
-						if (ent.preResolve()) {
-							resolvers.add(ent);
+				
+				Profiler.start("startTickRun stage 2");
+				try {
+					//Resolve collisions and prepare for a snapshot.
+					Set<SpoutEntity> resolvers = new HashSet<SpoutEntity>();
+					for (SpoutEntity ent : entityManager) {
+						//Try and determine if we should resolve collisions for this entity
+						//If the entity is not important (not an observer)
+						//And the entity is not visible to players, don't resolve it
+						if (visibleToPlayers || (ent.getController() != null && ent.getController().isImportant())) {
+							if (ent.preResolve()) {
+								resolvers.add(ent);
+							}
 						}
 					}
-				}
-
-				for (SpoutEntity ent : resolvers) {
-					try {
-						ent.resolve();
-					} catch (Exception e) {
-						Spout.getEngine().getLogger().severe("Unhandled exception during tick resolution for " + ent.toString());
-						e.printStackTrace();
+	
+					for (SpoutEntity ent : resolvers) {
+						try {
+							ent.resolve();
+						} catch (Exception e) {
+							Spout.getEngine().getLogger().severe("Unhandled exception during tick resolution for " + ent.toString());
+							e.printStackTrace();
+						}
 					}
+				} finally {
+					Profiler.stop();
 				}
 				break;
 			}
@@ -702,59 +720,48 @@ public class SpoutRegion extends Region{
 	public void haltRun() {
 	}
 
-	private int compressDx = 0;
-	private int compressDy = 0;
-
+	private int reapX = 0, reapY = 0, reapZ = 0;
 	public void finalizeRun() {
-
-		long worldAge = getWorld().getAge();
-
-		// Compress at most 1 chunk per tick per region
-		boolean chunkCompressed = false;
-
-		int percentObserved = (100 * SpoutChunk.getObservedChunks()) / (SpoutChunk.getActiveChunks());
-		
-		int multiplier = percentObserved < 70 ? 20 : (percentObserved >= 90 ? 1 : (90 - percentObserved));
-		int maxReapCount = REAP_PER_TICK * multiplier;
-
-		compressDy++;
-		if (compressDy >= CHUNKS.SIZE) {
-			compressDy = 0;
-			compressDx++;
-			if (compressDx >= CHUNKS.SIZE) {
-				compressDx = 0;
-			}
-		}
-		
-		int reaped = 0;
-
-		for (int dz = 0; dz < CHUNKS.SIZE && !chunkCompressed; dz++) {
-			Chunk chunk = chunks[compressDx][compressDy][dz].get();
-			if (chunk != null) {
-				chunkCompressed |= ((SpoutChunk) chunk).compressIfRequired();
-
-				if (reaped < maxReapCount && ((SpoutChunk) chunk).isReapable(worldAge)) {
-					boolean do_unload = true;
-					if (ChunkUnloadEvent.getHandlerList().getRegisteredListeners().length > 0) {
-						ChunkUnloadEvent event = Spout.getEngine().getEventManager().callEvent(new ChunkUnloadEvent(chunk));
-						if (event.isCancelled()) {
-							do_unload = false;
+		Profiler.start("finalizeRun");
+		try {
+			Profiler.start("compression");
+			long worldAge = getWorld().getAge();
+			for (int reap = 0; reap < REAP_PER_TICK; reap++) {
+				if (++reapX >= CHUNKS.SIZE) {
+					reapX = 0;
+					if (++reapY >= CHUNKS.SIZE) {
+						reapY = 0;
+						if (++reapZ >= CHUNKS.SIZE) {
+							reapZ = 0;
 						}
 					}
-					if (do_unload) {
-						((SpoutChunk) chunk).unload(true);
-						reaped++;
+				}
+				SpoutChunk chunk = chunks[reapX][reapY][reapZ].get();
+				if (chunk != null) {
+					chunk.compressIfRequired();
+					boolean doUnload;
+					if (doUnload = chunk.isReapable(worldAge)) {
+						if (ChunkUnloadEvent.getHandlerList().getRegisteredListeners().length > 0) {
+							ChunkUnloadEvent event = Spout.getEngine().getEventManager().callEvent(new ChunkUnloadEvent(chunk));
+							if (event.isCancelled()) {
+								doUnload = false;
+							}
+						}
 					}
-				} else {
-					if (!chunk.isPopulated()) {
+					if (doUnload) {
+						chunk.unload(true);
+					} else if (!chunk.isPopulated()) {
 						queueChunkForPopulation(chunk);
 					}
 				}
 			}
+			Profiler.startAndStop("entitymanager");
+			//Note: This must occur after any chunks are reaped, because reaping chunks may kill entities, which need to be finalized
+			entityManager.finalizeRun();
+			Profiler.stop();
+		} finally {
+			Profiler.stop();
 		}
-
-		//Note: This must occur after any chunks are reaped, because reaping chunks may kill entities, which need to be finalized
-		entityManager.finalizeRun();
 	}
 
 	private void syncChunkToPlayers(SpoutChunk chunk, Entity entity) {
@@ -807,54 +814,60 @@ public class SpoutRegion extends Region{
 	}
 
 	public void preSnapshotRun() {
-		entityManager.preSnapshotRun();
-
-		for (int dx = 0; dx < CHUNKS.SIZE; dx++) {
-			for (int dy = 0; dy < CHUNKS.SIZE; dy++) {
-				for (int dz = 0; dz < CHUNKS.SIZE; dz++) {
-					Chunk chunk = chunks[dx][dy][dz].get();
-					if (chunk == null) {
-						continue;
-					}
-					SpoutChunk spoutChunk = (SpoutChunk) chunk;
-
-					if (spoutChunk.isPopulated() && spoutChunk.isDirty()) {
-						spoutChunk.setRenderDirty();
-						for (Entity entity : spoutChunk.getObserversLive()) {
-							//chunk.refreshObserver(entity);
-							if (!(entity.getController() instanceof PlayerController)) {
-								continue;
-							}
-							syncChunkToPlayers(spoutChunk, entity);
+		Profiler.start("finalizeRun");
+		try {
+			entityManager.preSnapshotRun();
+	
+			for (int dx = 0; dx < CHUNKS.SIZE; dx++) {
+				for (int dy = 0; dy < CHUNKS.SIZE; dy++) {
+					for (int dz = 0; dz < CHUNKS.SIZE; dz++) {
+						Chunk chunk = chunks[dx][dy][dz].get();
+						if (chunk == null) {
+							continue;
 						}
-						processChunkUpdatedEvent(spoutChunk);
-
-						spoutChunk.resetDirtyArrays();
-						spoutChunk.setLightDirty(false);
+						SpoutChunk spoutChunk = (SpoutChunk) chunk;
+	
+						if (spoutChunk.isPopulated() && spoutChunk.isDirty()) {
+							spoutChunk.setRenderDirty();
+							for (Entity entity : spoutChunk.getObserversLive()) {
+								//chunk.refreshObserver(entity);
+								if (!(entity.getController() instanceof PlayerController)) {
+									continue;
+								}
+								syncChunkToPlayers(spoutChunk, entity);
+							}
+							processChunkUpdatedEvent(spoutChunk);
+	
+							spoutChunk.resetDirtyArrays();
+							spoutChunk.setLightDirty(false);
+						}
 					}
 				}
+	
+				SpoutChunkSnapshotFuture snapshotFuture;
+				while ((snapshotFuture = snapshotQueue.poll()) != null) {
+					snapshotFuture.run();
+				}
+	
 			}
-
-			SpoutChunkSnapshotFuture snapshotFuture;
-			while ((snapshotFuture = snapshotQueue.poll()) != null) {
-				snapshotFuture.run();
+			Iterator<SpoutChunk> itr = occupiedChunks.iterator();
+			int cx, cy, cz;
+			while (itr.hasNext()) {
+				SpoutChunk c = itr.next();
+	
+				cx = c.getX() & CHUNKS.MASK;
+				cy = c.getY() & CHUNKS.MASK;
+				cz = c.getZ() & CHUNKS.MASK;
+	
+				if (c == getChunk(cx, cy, cz, LoadOption.NO_LOAD)) {
+					c.syncEntities();
+				} else {
+					itr.remove();
+				}
 			}
-
 		}
-		Iterator<SpoutChunk> itr = occupiedChunks.iterator();
-		int cx, cy, cz;
-		while (itr.hasNext()) {
-			SpoutChunk c = itr.next();
-
-			cx = c.getX() & CHUNKS.MASK;
-			cy = c.getY() & CHUNKS.MASK;
-			cz = c.getZ() & CHUNKS.MASK;
-
-			if (c == getChunk(cx, cy, cz, LoadOption.NO_LOAD)) {
-				c.syncEntities();
-			} else {
-				itr.remove();
-			}
+		finally {
+			Profiler.stop();
 		}
 	}
 
@@ -879,8 +892,9 @@ public class SpoutRegion extends Region{
 				int y = queue.getY();
 				int z = queue.getZ();
 				Source source = queue.getSource();
-				if (!callOnUpdatePhysicsForRange(world, x, y, z, source, false)) {
-					physicsQueue.queueForUpdateMultiRegion(x, y, z, source);
+				BlockMaterial oldMaterial = queue.getOldMaterial();
+				if (!callOnUpdatePhysicsForRange(world, x, y, z, oldMaterial, source, false)) {
+					physicsQueue.queueForUpdateMultiRegion(x, y, z, oldMaterial, source);
 				}
 			}
 		}
@@ -896,12 +910,13 @@ public class SpoutRegion extends Region{
 			int y = queue.getY();
 			int z = queue.getZ();
 			Source source = queue.getSource();
-			callOnUpdatePhysicsForRange(world, x, y, z, source, true);
+			BlockMaterial oldMaterial = queue.getOldMaterial();
+			callOnUpdatePhysicsForRange(world, x, y, z, oldMaterial, source, true);
 		}
 		return physicsUpdates;
 	}
 
-	private boolean callOnUpdatePhysicsForRange(World world, int x, int y, int z, Source source, boolean force) {
+	private boolean callOnUpdatePhysicsForRange(World world, int x, int y, int z, BlockMaterial oldMaterial, Source source, boolean force) {
 		//switch region block coords (0-255) to a chunk index
 		Chunk chunk = getChunkFromBlock(x, y, z);
 		int packed = chunk.getBlockFullState(x, y, z);
@@ -913,7 +928,7 @@ public class SpoutRegion extends Region{
 			}
 			//switch region block coords (0-255) to world block coords
 			Block block = world.getBlock(x + this.getBlockX(), y + this.getBlockY(), z + this.getBlockZ(), source);
-			block.getMaterial().onUpdate(block);
+			block.getMaterial().onUpdate(oldMaterial, block);
 			physicsUpdates++;
 		}
 		return true;
@@ -1014,13 +1029,13 @@ public class SpoutRegion extends Region{
 	}
 
 	/**
-	 * Gets the DataOutputStream corresponding to a given Chunk.<br>
+	 * Gets the DataOutputStream corresponding to a given Chunk Snapshot.<br>
 	 * <br>
 	 * WARNING: This block will be locked until the stream is closed
-	 * @param c the chunk
+	 * @param c the chunk snapshot
 	 * @return the DataOutputStream
 	 */
-	public OutputStream getChunkOutputStream(Chunk c) {
+	public OutputStream getChunkOutputStream(ChunkSnapshot c) {
 		int key = getChunkKey(c.getX(), c.getY(), c.getZ());
 		return chunkStore.getBlockOutputStream(key);
 	}
@@ -1134,12 +1149,16 @@ public class SpoutRegion extends Region{
 
 	@Override
 	public void queueBlockPhysics(int x, int y, int z, EffectRange range, Source source) {
-		physicsQueue.queueForUpdateAsync(x, y, z, range, source);
+		queueBlockPhysics(x, y, z, range, null, source);
+	}
+	
+	public void queueBlockPhysics(int x, int y, int z, EffectRange range, BlockMaterial oldMaterial, Source source) {
+		physicsQueue.queueForUpdateAsync(x, y, z, range, oldMaterial, source);
 	}
 
 	@Override
 	public void updateBlockPhysics(int x, int y, int z, Source source) {
-		physicsQueue.queueForUpdate(x, y, z, source);
+		physicsQueue.queueForUpdate(x, y, z, null, source);
 	}
 
 	protected void reportChunkLightDirty(int x, int y, int z) {
@@ -1206,6 +1225,11 @@ public class SpoutRegion extends Region{
 	@Override
 	public byte getBlockSkyLight(int x, int y, int z) {
 		return this.getChunkFromBlock(x, y, z).getBlockSkyLight(x, y, z);
+	}
+
+	@Override
+	public byte getBlockSkyLightRaw(int x, int y, int z) {
+		return getChunkFromBlock(x, y, z).getBlockSkyLightRaw(x, y, z);
 	}
 
 	@Override
@@ -1280,7 +1304,6 @@ public class SpoutRegion extends Region{
 		return dynamicBlockTree.queueBlockUpdates(x, y, z);
 	}
 
-
 	// TODO - save needs to call this method
 	public List<DynamicBlockUpdate> getDynamicBlockUpdates(Chunk c) {
 		Set<DynamicBlockUpdate> updates = dynamicBlockTree.getDynamicBlockUpdates(c);
@@ -1300,4 +1323,6 @@ public class SpoutRegion extends Region{
 	public void addSnapshotFuture(SpoutChunkSnapshotFuture future) {
 		snapshotQueue.add(future);
 	}
+	
+	
 }

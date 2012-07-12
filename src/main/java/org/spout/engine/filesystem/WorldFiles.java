@@ -67,6 +67,8 @@ import org.spout.engine.SpoutEngine;
 import org.spout.engine.entity.SpoutEntity;
 import org.spout.engine.world.FilteredChunk;
 import org.spout.engine.world.SpoutChunk;
+import org.spout.engine.world.SpoutChunk.PopulationState;
+import org.spout.engine.world.SpoutChunkSnapshot;
 import org.spout.engine.world.SpoutRegion;
 import org.spout.engine.world.SpoutWorld;
 import org.spout.engine.world.dynamic.DynamicBlockUpdate;
@@ -145,7 +147,7 @@ public class WorldFiles {
 				CompoundMap map = dataTag.getValue();
 
 				byte version = SafeCast.toByte(NBTMapper.toTagValue(map.get("version")), WORLD_VERSION);
-				switch (version) {                                                          
+				switch (version) {
 					case 1:
 						world = loadVersionOne(name, generator, global, map);
 						break;
@@ -185,7 +187,7 @@ public class WorldFiles {
 		if (itemMapFile.exists()) {
 			itemStore.load();
 		}
-		StringMap itemMap = new StringMap(global, itemStore, 0, Short.MAX_VALUE);
+		StringMap itemMap = new StringMap(global, itemStore, 0, Short.MAX_VALUE, name + "ItemMap");
 
 		String generatorName = generator.getName();
 
@@ -231,7 +233,7 @@ public class WorldFiles {
 		if (itemMapFile.exists()) {
 			itemStore.load();
 		}
-		StringMap itemMap = new StringMap(global, itemStore, 0, Short.MAX_VALUE);
+		StringMap itemMap = new StringMap(global, itemStore, 0, Short.MAX_VALUE, name + "ItemMap");
 
 		String generatorName = generator.getName();
 
@@ -256,11 +258,12 @@ public class WorldFiles {
 		return world;
 	}
 
-	public static void saveChunk(SpoutChunk c, short[] blocks, short[] data, byte[] skyLight, byte[] blockLight, DatatableMap extraData, OutputStream dos) {
+	public static void saveChunk(SpoutWorld world, SpoutChunkSnapshot snapshot, List<DynamicBlockUpdate> blockUpdates, OutputStream dos) {
 		CompoundMap chunkTags = new CompoundMap();
+		short[] blocks = snapshot.getBlockIds();
+		short[] data = snapshot.getBlockData();
 
 		//Switch block ids from engine material ids to world specific ids
-		SpoutWorld world = c.getWorld();
 		StringMap global = ((SpoutEngine) Spout.getEngine()).getEngineItemMap();
 		StringMap itemMap = world.getItemMap();
 		for (int i = 0; i < blocks.length; i++) {
@@ -269,24 +272,24 @@ public class WorldFiles {
 
 		chunkTags.put(new ByteTag("version", CHUNK_VERSION));
 		chunkTags.put(new ByteTag("format", (byte) 0));
-		chunkTags.put(new IntTag("x", c.getX()));
-		chunkTags.put(new IntTag("y", c.getY()));
-		chunkTags.put(new IntTag("z", c.getZ()));
-		chunkTags.put(new ByteTag("populated", c.isPopulated()));
+		chunkTags.put(new IntTag("x", snapshot.getX()));
+		chunkTags.put(new IntTag("y", snapshot.getY()));
+		chunkTags.put(new IntTag("z", snapshot.getZ()));
+		chunkTags.put(new ByteTag("populationState", snapshot.getPopulationState().getId()));
 		chunkTags.put(new ShortArrayTag("blocks", blocks));
 		chunkTags.put(new ShortArrayTag("data", data));
-		chunkTags.put(new ByteArrayTag("skyLight", skyLight));
-		chunkTags.put(new ByteArrayTag("blockLight", blockLight));
-		chunkTags.put(new CompoundTag("entities", saveEntities(c)));
-		chunkTags.put(saveDynamicUpdates(c));
+		chunkTags.put(new ByteArrayTag("skyLight", snapshot.getSkyLight()));
+		chunkTags.put(new ByteArrayTag("blockLight", snapshot.getBlockLight()));
+		chunkTags.put(new CompoundTag("entities", saveEntities(snapshot.getEntities())));
+		chunkTags.put(saveDynamicUpdates(blockUpdates));
 
-		byte[] biomes = c.getBiomeManager().serialize();
+		byte[] biomes = snapshot.getBiomeManager().serialize();
 		if (biomes != null) {
-			chunkTags.put(new StringTag("biomeManager", c.getBiomeManager().getClass().getCanonicalName()));
+			chunkTags.put(new StringTag("biomeManager", snapshot.getBiomeManager().getClass().getCanonicalName()));
 			chunkTags.put(new ByteArrayTag("biomes", biomes));
 		}
 
-		chunkTags.put(new ByteArrayTag("extraData", extraData.compress()));
+		chunkTags.put(new ByteArrayTag("extraData", ((DataMap)snapshot.getDataMap()).getRawMap().compress()));
 
 		CompoundTag chunkCompound = new CompoundTag("chunk", chunkTags);
 
@@ -295,7 +298,7 @@ public class WorldFiles {
 			os = new NBTOutputStream(dos, false);
 			os.writeTag(chunkCompound);
 		} catch (IOException e) {
-			Spout.getLogger().log(Level.SEVERE, "Error saving chunk " + c.toString(), e);
+			Spout.getLogger().log(Level.SEVERE, "Error saving chunk {" + snapshot.getX() + ", " + snapshot.getY() + ", " + snapshot + "}", e);
 		} finally {
 			if (os != null) {
 				try {
@@ -323,7 +326,7 @@ public class WorldFiles {
 			int cy = r.getChunkY() + y;
 			int cz = r.getChunkZ() + z;
 
-			boolean populated = SafeCast.toGeneric(map.get("populated"), new ByteTag("", false), ByteTag.class).getBooleanValue();
+			byte populationState = SafeCast.toGeneric(map.get("populationState"), new ByteTag("", PopulationState.POPULATED.getId()), ByteTag.class).getValue();
 			short[] blocks = SafeCast.toShortArray(NBTMapper.toTagValue(map.get("blocks")), null);
 			short[] data = SafeCast.toShortArray(NBTMapper.toTagValue(map.get("data")), null);
 			byte[] skyLight = SafeCast.toByteArray(NBTMapper.toTagValue(map.get("skyLight")), null);
@@ -349,7 +352,7 @@ public class WorldFiles {
 				manager = new EmptyBiomeManager(cx, cy, cz);
 			}
 
-			//Convert world block ids to engine material ids 
+			//Convert world block ids to engine material ids
 			SpoutWorld world = r.getWorld();
 			StringMap global = ((SpoutEngine) Spout.getEngine()).getEngineItemMap();
 			StringMap itemMap = world.getItemMap();
@@ -360,7 +363,7 @@ public class WorldFiles {
 			DatatableMap extraDataMap = new GenericDatatableMap();
 			extraDataMap.decompress(extraData);
 
-			chunk = new FilteredChunk(r.getWorld(), r, cx, cy, cz, populated, blocks, data, skyLight, blockLight, manager, extraDataMap);
+			chunk = new FilteredChunk(r.getWorld(), r, cx, cy, cz, PopulationState.byID(populationState), blocks, data, skyLight, blockLight, manager, extraDataMap);
 
 			CompoundMap entityMap = SafeCast.toGeneric(NBTMapper.toTagValue(map.get("entities")), null, CompoundMap.class);
 			loadEntities(r, entityMap, dataForRegion.loadedEntities);
@@ -391,8 +394,7 @@ public class WorldFiles {
 		}
 	}
 
-	private static CompoundMap saveEntities(SpoutChunk c) {
-		Set<Entity> entities = c.getLiveEntities();
+	private static CompoundMap saveEntities(Set<Entity> entities) {
 		CompoundMap tagMap = new CompoundMap();
 
 		for (Entity e : entities) {
@@ -519,9 +521,7 @@ public class WorldFiles {
 		return tag;
 	}
 
-	private static ListTag<CompoundTag> saveDynamicUpdates(SpoutChunk c) {
-		List<DynamicBlockUpdate> updates = c.getRegion().getDynamicBlockUpdates(c);
-
+	private static ListTag<CompoundTag> saveDynamicUpdates(List<DynamicBlockUpdate> updates) {
 		List<CompoundTag> list = new ArrayList<CompoundTag>(updates.size());
 
 		for (DynamicBlockUpdate update : updates) {

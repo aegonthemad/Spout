@@ -24,19 +24,12 @@
  * License and see <http://www.spout.org/SpoutDevLicenseV1.txt> for the full license,
  * including the MIT license.
  */
-package org.spout.engine.renderer.shader;
+package org.spout.engine.chat.style;
 
-/**
- * Empty Shader for 1.1 only.  Do not use this for 3.0 ever.
- * @author RoyAwesome
- */
-public class EmptyShader extends ClientShader {
-	public EmptyShader() {
-		super(null, null);
-	}
+import org.fusesource.jansi.Ansi;
 
-	@Override
-	public void assign() {
-		return;
+public class BoldJansiFormatter extends JansiStyleFormatter {
+	public void format(Ansi ansi, String text) {
+		ansi.a(Ansi.Attribute.INTENSITY_BOLD).a(text).a(Ansi.Attribute.INTENSITY_BOLD_OFF);
 	}
 }

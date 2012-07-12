@@ -42,6 +42,8 @@ import org.spout.api.material.block.BlockFace;
 import org.spout.api.material.range.EffectRange;
 import org.spout.api.material.source.DataSource;
 import org.spout.api.material.source.MaterialSource;
+import org.spout.api.math.IntVector3;
+import org.spout.api.math.MathHelper;
 import org.spout.api.math.Vector3;
 import org.spout.api.util.LogicUtil;
 import org.spout.api.util.StringUtil;
@@ -149,6 +151,11 @@ public class SpoutBlock implements Block {
 	}
 
 	@Override
+	public Block translate(IntVector3 offset) {
+		return this.translate(offset.getX(), offset.getY(), offset.getZ());
+	}
+
+	@Override
 	public Block translate(int dx, int dy, int dz) {
 		SpoutBlock sb = this.clone();
 		sb.x += dx;
@@ -156,6 +163,19 @@ public class SpoutBlock implements Block {
 		sb.z += dz;
 		sb.chunk = null;
 		return sb;
+	}
+
+	@Override
+	public Block getSurface() {
+		int height = this.world.getSurfaceHeight(this.x, this.z, true);
+		if (height == this.y) {
+			return this;
+		} else {
+			SpoutBlock sb = this.clone();
+			sb.y = height;
+			sb.chunk = null;
+			return sb;
+		}
 	}
 
 	@Override
@@ -169,7 +189,7 @@ public class SpoutBlock implements Block {
 			return false;
 		}
 	}
-	
+
 	@Override
 	public int hashCode() {
 		return new HashCodeBuilder().append(getWorld()).append(getX()).append(getY()).append(getZ()).toHashCode();
@@ -178,6 +198,11 @@ public class SpoutBlock implements Block {
 	@Override
 	public SpoutBlock clone() {
 		return new SpoutBlock(this);
+	}
+
+	@Override
+	public boolean isAtSurface() {
+		return this.y >= this.world.getSurfaceHeight(this.x, this.z, true);
 	}
 
 	@Override
@@ -210,7 +235,7 @@ public class SpoutBlock implements Block {
 	public short getData() {
 		return this.getChunk().getBlockData(this.x, this.y, this.z);
 	}
-	
+
 	@Override
 	public short setDataBits(int bits) {
 		return this.getChunk().setBlockDataBits(this.x, this.y, this.z, bits, this.source);
@@ -230,7 +255,7 @@ public class SpoutBlock implements Block {
 	public int getDataField(int bits) {
 		return this.getChunk().getBlockDataField(this.x, this.y, this.z, bits);
 	}
-	
+
 	@Override
 	public boolean isDataBitSet(int bits) {
 		return this.getChunk().isBlockDataBitSet(this.x, this.y, this.z, bits);
@@ -280,18 +305,7 @@ public class SpoutBlock implements Block {
 
 	@Override
 	public byte getLight() {
-		return this.getChunk().getBlockLight(this.x, this.y, this.z);
-	}
-
-	@Override
-	public Block setLight(byte level) {
-		this.getChunk().setBlockLight(this.x, this.y, this.z, level, this.source);
-		return this;
-	}
-
-	@Override
-	public byte getSkyLight() {
-		return this.getChunk().getBlockSkyLight(this.x, this.y, this.z);
+		return MathHelper.max(this.getSkyLight(), this.getBlockLight());
 	}
 
 	@Override
@@ -301,14 +315,35 @@ public class SpoutBlock implements Block {
 	}
 
 	@Override
-	public BlockController getController() {
-		return getRegion().getBlockController(x, y, z);
+	public Block setBlockLight(byte level) {
+		this.getChunk().setBlockLight(this.x, this.y, this.z, level, this.source);
+		return this;
 	}
 
 	@Override
-	public Block setController(BlockController controller) {
-		getRegion().setBlockController(x, y, z, controller);
-		return this;
+	public byte getBlockLight() {
+		return this.getChunk().getBlockLight(this.x, this.y, this.z);
+	}
+
+	@Override
+	public byte getSkyLight() {
+		return this.getChunk().getBlockSkyLight(this.x, this.y, this.z);
+	}
+
+	@Override
+	public byte getSkyLightRaw() {
+		return this.getChunk().getBlockSkyLightRaw(this.x, this.y, this.z);
+	}
+
+	@Override
+	@SuppressWarnings("unchecked")
+	public <T extends BlockController> T getController() {
+		BlockMaterial material = this.getMaterial();
+		if (material.hasController()) {
+			return (T) material.getController(this);
+		} else {
+			return null;
+		}
 	}
 
 	@Override
@@ -325,7 +360,7 @@ public class SpoutBlock implements Block {
 	public Biome getBiomeType() {
 		return world.getBiomeType(x, y, z);
 	}
-	
+
 	@Override
 	public void resetDynamic() {
 		this.getRegion().resetDynamicBlock(this.x, this.y, this.z);
@@ -345,7 +380,7 @@ public class SpoutBlock implements Block {
 	public DynamicUpdateEntry dynamicUpdate(long updateTime, Object hint) {
 		return this.getRegion().queueDynamicUpdate(this.x, this.y, this.z, updateTime, hint);
 	}
-	
+
 	@Override
 	public DynamicUpdateEntry dynamicUpdate(long updateTime, int data, Object hint) {
 		return this.getRegion().queueDynamicUpdate(this.x, this.y, this.z, updateTime, data, hint);
@@ -353,6 +388,6 @@ public class SpoutBlock implements Block {
 
 	@Override
 	public boolean isMaterial(Material... materials) {
-		return LogicUtil.equalsAny(this.getMaterial(), materials);
+		return LogicUtil.equalsAny(this.getMaterial(), (Object[]) materials);
 	}
 }

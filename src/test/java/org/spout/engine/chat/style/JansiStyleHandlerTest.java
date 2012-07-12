@@ -24,19 +24,24 @@
  * License and see <http://www.spout.org/SpoutDevLicenseV1.txt> for the full license,
  * including the MIT license.
  */
-package org.spout.engine.renderer.shader;
+package org.spout.engine.chat.style;
 
-/**
- * Empty Shader for 1.1 only.  Do not use this for 3.0 ever.
- * @author RoyAwesome
- */
-public class EmptyShader extends ClientShader {
-	public EmptyShader() {
-		super(null, null);
-	}
+import org.junit.Test;
+import org.spout.api.chat.style.ChatStyle;
+import org.spout.api.chat.style.ColorChatStyle;
+import org.spout.api.chat.style.FormatChatStyle;
 
-	@Override
-	public void assign() {
-		return;
+import static org.junit.Assert.*;
+
+public class JansiStyleHandlerTest {
+	@Test
+	public void testInclusion() {
+		for (ChatStyle style : ChatStyle.getValues()) {
+			if (style instanceof ColorChatStyle || style instanceof FormatChatStyle && style != ChatStyle.CONCEAL) {
+				if (!(JansiStyleHandler.INSTANCE.getFormatter(style) instanceof JansiStyleFormatter)) {
+					fail("Style " + style.getName() + " does not have a formatter in JansiStyleHandler but needs one");
+				}
+			}
+		}
 	}
 }

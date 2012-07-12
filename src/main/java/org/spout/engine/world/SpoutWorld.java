@@ -164,7 +164,12 @@ public final class SpoutWorld extends AsyncManager implements World {
 	protected final SpoutParallelTaskManager parallelTaskManager;
 	
 	private final SpoutTaskManager taskManager;
-	
+
+	/**
+	 * The sky light level the sky emits
+	 */
+	private byte skyLightLevel = 15;
+
 	/**
 	 * Hashcode cache
 	 */
@@ -512,6 +517,16 @@ public final class SpoutWorld extends AsyncManager implements World {
 	}
 
 	@Override
+	public byte getSkyLight() {
+		return this.skyLightLevel;
+	}
+
+	@Override
+	public void setSkyLight(byte newLight) {
+		this.skyLightLevel = newLight;
+	}
+
+	@Override
 	public boolean setBlockMaterial(int x, int y, int z, BlockMaterial material, short data, Source source) {
 		return this.getChunkFromBlock(x, y, z).setBlockMaterial(x, y, z, material, data, source);
 	}
@@ -539,6 +554,11 @@ public final class SpoutWorld extends AsyncManager implements World {
 	@Override
 	public byte getBlockSkyLight(int x, int y, int z) {
 		return getChunkFromBlock(x, y, z).getBlockSkyLight(x, y, z);
+	}
+
+	@Override
+	public byte getBlockSkyLightRaw(int x, int y, int z) {
+		return getChunkFromBlock(x, y, z).getBlockSkyLightRaw(x, y, z);
 	}
 
 	@Override
@@ -588,7 +608,11 @@ public final class SpoutWorld extends AsyncManager implements World {
 	
 	@Override
 	public void queueBlockPhysics(int x, int y, int z, EffectRange range, Source source) {
-		this.getRegionFromBlock(x, y, z).queueBlockPhysics(x, y, z, range, source);
+		queueBlockPhysics(x, y, z, range, null, source);
+	}
+	
+	public void queueBlockPhysics(int x, int y, int z, EffectRange range, BlockMaterial oldMaterial, Source source) {
+		this.getRegionFromBlock(x, y, z).queueBlockPhysics(x, y, z, range, oldMaterial, source);
 	}
 
 	@Override
@@ -865,7 +889,7 @@ public final class SpoutWorld extends AsyncManager implements World {
 		return worldDirectory;
 	}
 
-	public void unload(boolean save) {
+	public void unload(boolean save, boolean force) {
 		this.getLightingManager().abort();
 		if (save) {
 			WorldFiles.saveWorldData(this);
@@ -874,7 +898,7 @@ public final class SpoutWorld extends AsyncManager implements World {
 		final int total = Math.max(1, regions.size());
 		int progress = 0;
 		for (Region r : regions) {
-			r.unload(save);
+			((SpoutRegion)r).unload(save, force);
 			progress++;
 			if (save && progress % 4 == 0) {
 				Spout.getLogger().info("Saving world [" + getName() + "], " + (int)(progress * 100F / total) + "% Complete");
@@ -945,8 +969,13 @@ public final class SpoutWorld extends AsyncManager implements World {
 	public DefaultedMap<String, Serializable> getDataMap() {
 		return dataMap;
 	}
-	
-	public StringMap getItemMap() {
+
+    @Override
+    public Serializable get(Object key) {
+        return dataMap.get(key);
+    }
+
+    public StringMap getItemMap() {
 		return itemMap;
 	}
 
@@ -1067,9 +1096,7 @@ public final class SpoutWorld extends AsyncManager implements World {
 
 	/**
 	 * Gets the absolute closest player from the specified point within a specified range.
-	 * 
-	 * @param entity to search from
-	 * @param entity to ignore while searching
+	 *
 	 * @param range to search
 	 * @return nearest player
 	 */
@@ -1141,5 +1168,4 @@ public final class SpoutWorld extends AsyncManager implements World {
 	public int runGlobalDynamicUpdates() throws InterruptedException {
 		return 0;
 	}
-
 }

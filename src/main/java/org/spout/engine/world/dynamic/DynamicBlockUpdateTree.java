@@ -47,7 +47,6 @@ import org.spout.api.material.DynamicMaterial;
 import org.spout.api.material.DynamicUpdateEntry;
 import org.spout.api.material.Material;
 import org.spout.api.material.range.EffectRange;
-import org.spout.api.math.Vector3;
 import org.spout.api.scheduler.TickStage;
 import org.spout.engine.scheduler.SpoutScheduler;
 import org.spout.engine.world.SpoutRegion;
@@ -72,7 +71,6 @@ public class DynamicBlockUpdateTree {
 	private ConcurrentHashMap<PointAlone, Boolean> resetPendingMap = new ConcurrentHashMap<PointAlone, Boolean>();
 	private ConcurrentLinkedQueue<List<DynamicBlockUpdate>> pendingLists = new ConcurrentLinkedQueue<List<DynamicBlockUpdate>>();
 	private TIntHashSet processed = new TIntHashSet();
-	private final static Vector3[] zeroVector3Array = new Vector3[] {Vector3.ZERO};
 	private final Thread regionThread;
 	private final Thread mainThread;
 	private final static int localStages = TickStage.DYNAMIC_BLOCKS | TickStage.PHYSICS;
@@ -309,7 +307,6 @@ public class DynamicBlockUpdateTree {
 	private DynamicBlockUpdate add(DynamicBlockUpdate update) {
 		int key = update.getPacked();
 		DynamicBlockUpdate oldRoot = blockToUpdateMap.get(key);
-		
 		DynamicBlockUpdate previous = null;
 		if (oldRoot != null) {
 			DynamicBlockUpdate current = oldRoot;
@@ -321,6 +318,9 @@ public class DynamicBlockUpdateTree {
 					previous = current;
 					oldRoot = blockToUpdateMap.get(key);
 					break;
+				} else {
+					// Obtain next update of this block
+					current = current.getNext();
 				}
 			}
 		}

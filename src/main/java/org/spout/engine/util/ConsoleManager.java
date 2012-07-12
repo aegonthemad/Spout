@@ -70,12 +70,14 @@ import jline.Completor;
 import jline.ConsoleOperations;
 import jline.ConsoleReader;
 import jline.NullCompletor;
-import org.spout.api.ChatColor;
+import org.fusesource.jansi.Ansi;
+import org.spout.api.chat.style.ChatStyle;
 import org.spout.api.Engine;
 import org.spout.api.Spout;
 import org.spout.api.command.CommandSource;
 import org.spout.api.data.ValueHolder;
 import org.spout.api.geo.World;
+import org.spout.engine.chat.style.JansiStyleHandler;
 
 /**
  * A meta-class to handle all logging and input-related console improvements.
@@ -93,6 +95,7 @@ public final class ConsoleManager {
 	private JTextField jInput = null;
 	private boolean running = true;
 	private boolean jLine = false;
+	private boolean closed = false;
 
 	public ConsoleManager(Engine engine) {
 		this.engine = engine;
@@ -135,6 +138,9 @@ public final class ConsoleManager {
 
 		Completor[] list = new Completor[]{new SpoutCommandCompletor(engine), new NullCompletor()};
 		reader.addCompletor(new ArgumentCompletor(list));
+
+		LogFlushThread flushThread = new LogFlushThread(this);
+		flushThread.start();
 	}
 
 	public ColoredCommandSource getCommandSource() {
@@ -148,10 +154,17 @@ public final class ConsoleManager {
 		}
 	}
 
-	public void closeFiles() {
-		consoleHandler.flush();
+	public void flush() {
 		fileHandler.flush();
-		fileHandler.close();
+	}
+
+	public void closeFiles() {
+		if (!closed) {
+			consoleHandler.flush();
+			fileHandler.flush();
+			fileHandler.close();
+			closed = true;
+		}
 	}
 
 	public void setupConsole(String mode) {
@@ -210,37 +223,31 @@ public final class ConsoleManager {
 		}
 	}
 
-	public String colorize(String string) {
-		if (!string.contains("\u00A7")) {
-			return string;
-		} else if ((!jLine || !reader.getTerminal().isANSISupported()) && jTerminal == null) {
-			return ChatColor.strip(string);
-		} else {
-			return string.replace(ChatColor.RED.toString(), "\033[1;31m")
-					.replace(ChatColor.YELLOW.toString(), "\033[1;33m")
-					.replace(ChatColor.BRIGHT_GREEN.toString(), "\033[1;32m")
-					.replace(ChatColor.CYAN.toString(), "\033[1;36m")
-					.replace(ChatColor.BLUE.toString(), "\033[1;34m")
-					.replace(ChatColor.PINK.toString(), "\033[1;35m")
-					.replace(ChatColor.BLACK.toString(), "\033[0;0m")
-					.replace(ChatColor.DARK_GRAY.toString(), "\033[1;30m")
-					.replace(ChatColor.DARK_RED.toString(), "\033[0;31m")
-					.replace(ChatColor.GOLD.toString(), "\033[0;33m")
-					.replace(ChatColor.DARK_GREEN.toString(), "\033[0;32m")
-					.replace(ChatColor.DARK_CYAN.toString(), "\033[0;36m")
-					.replace(ChatColor.DARK_BLUE.toString(), "\033[0;34m")
-					.replace(ChatColor.PURPLE.toString(), "\033[0;35m")
-					.replace(ChatColor.GRAY.toString(), "\033[0;37m")
-					.replace(ChatColor.WHITE.toString(), "\033[1;37m") + "\033[0m";
+	private class LogFlushThread extends Thread {
+		ConsoleManager manager;
+		public LogFlushThread(ConsoleManager manager) {
+			super("Log Flush Thread");
+			this.setDaemon(true);
+			this.manager = manager;
+		}
+
+		@Override
+		public void run() {
+			while(!this.isInterrupted()) {
+				manager.flush();
+				try {
+					sleep(60000);
+				} catch (InterruptedException e) { }
+			}
 		}
 	}
 
 	private class ConsoleCommandThread extends Thread {
-		
+
 		public ConsoleCommandThread() {
 			super("Console Manager");
 		}
-		
+
 		@Override
 		public void run() {
 			String command;
@@ -291,6 +298,14 @@ public final class ConsoleManager {
 		}
 	}
 
+	private String stringify(Object... message) {
+		if (Ansi.isEnabled()) {
+			return Ansi.ansi().a(ChatStyle.stringify(JansiStyleHandler.ID, message)).reset().toString();
+		} else {
+			return ChatStyle.stringify(message);
+		}
+	}
+
 	// TODO - convert to command source
 	public class ColoredCommandSource implements CommandSource {
 		@Override
@@ -299,14 +314,14 @@ public final class ConsoleManager {
 		}
 
 		@Override
-		public boolean sendMessage(String text) {
-			engine.getLogger().info(text);
+		public boolean sendMessage(Object... text) {
+			engine.getLogger().info(stringify(text));
 			return true;
 		}
 
 		@Override
-		public boolean sendRawMessage(String text) {
-			engine.getLogger().info(text);
+		public boolean sendRawMessage(Object... text) {
+			engine.getLogger().info(stringify(text));
 			return true;
 		}
 
@@ -427,7 +442,7 @@ public final class ConsoleManager {
 			}
 			super.flush();
 		}
-		
+
 		@Override
 		public synchronized void publish(LogRecord record) {
 			super.publish(record);
@@ -456,7 +471,7 @@ public final class ConsoleManager {
 			builder.append(" [");
 			builder.append(record.getLevel().getLocalizedName().toUpperCase());
 			builder.append("] ");
-			builder.append(colorize(formatMessage(record)));
+			builder.append(formatMessage(record));
 			builder.append('\n');
 
 			if (record.getThrown() != null) {
