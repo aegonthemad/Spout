@@ -267,7 +267,7 @@ public final class SpoutSession implements Session {
 	}
 
 	@Override
-	public boolean disconnect(boolean kick, Object... reason) {
+	public boolean disconnect(Boolean kick, Object... reason) {
 		if (player != null) {
 			PlayerLeaveEvent event;
 			if (kick) {
