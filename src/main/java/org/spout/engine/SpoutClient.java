@@ -30,15 +30,25 @@ import static org.lwjgl.opengl.GL11.GL_COLOR_BUFFER_BIT;
 import static org.lwjgl.opengl.GL11.GL_DEPTH_BUFFER_BIT;
 import static org.lwjgl.opengl.GL11.glClear;
 
-import java.awt.Color;
 import java.io.File;
 import java.io.IOException;
 import java.net.URISyntaxException;
 import java.security.CodeSource;
+import java.util.Collection;
+import java.util.Collections;
+import java.util.UUID;
+import java.util.concurrent.ExecutorService;
+import java.util.concurrent.Executors;
+import java.util.concurrent.atomic.AtomicReference;
 import java.util.logging.Level;
 
 import org.apache.commons.io.FileUtils;
 import org.apache.commons.lang3.SystemUtils;
+import org.jboss.netty.bootstrap.ClientBootstrap;
+import org.jboss.netty.channel.Channel;
+import org.jboss.netty.channel.ChannelFactory;
+import org.jboss.netty.channel.ChannelPipelineFactory;
+import org.jboss.netty.channel.socket.nio.NioClientSocketChannelFactory;
 import org.lwjgl.LWJGLException;
 import org.lwjgl.opengl.ContextAttribs;
 import org.lwjgl.opengl.Display;
@@ -49,55 +59,67 @@ import org.lwjgl.opengl.GL30;
 import org.lwjgl.opengl.PixelFormat;
 import org.spout.api.Client;
 import org.spout.api.Spout;
-import org.spout.api.entity.Entity;
+import org.spout.api.audio.SoundManager;
+import org.spout.api.command.CommandRegistrationsFactory;
+import org.spout.api.command.CommandSource;
+import org.spout.api.command.annotated.AnnotatedCommandRegistrationFactory;
+import org.spout.api.command.annotated.SimpleInjector;
 import org.spout.api.geo.World;
-import org.spout.api.geo.cuboid.ChunkSnapshot;
-import org.spout.api.gui.screen.ScreenStack;
-import org.spout.api.material.BlockMaterial;
+import org.spout.api.keyboard.Input;
 import org.spout.api.math.MathHelper;
-import org.spout.api.math.Matrix;
 import org.spout.api.math.Vector2;
 import org.spout.api.math.Vector3;
 import org.spout.api.plugin.Platform;
 import org.spout.api.plugin.PluginStore;
+import org.spout.api.protocol.CommonPipelineFactory;
+import org.spout.api.protocol.PortBinding;
+import org.spout.api.protocol.Protocol;
+import org.spout.api.protocol.Session;
+import org.spout.api.protocol.builtin.SpoutClientProtocol;
 import org.spout.api.render.BasicCamera;
 import org.spout.api.render.Camera;
-import org.spout.api.render.RenderMaterial;
 import org.spout.api.render.RenderMode;
-import org.spout.api.render.Texture;
-import org.spout.api.util.map.TInt21TripleObjectHashMap;
-import org.spout.engine.batcher.PrimitiveBatch;
+import org.spout.engine.audio.SpoutSoundManager;
+import org.spout.engine.command.InputCommands;
 import org.spout.engine.filesystem.ClientFileSystem;
-import org.spout.engine.mesh.BaseMesh;
-import org.spout.engine.renderer.BatchVertexRenderer;
-import org.spout.engine.renderer.VertexBufferBatcher;
-import org.spout.engine.renderer.vertexbuffer.VertexBufferImpl;
-import org.spout.engine.util.RenderModeConverter;
-import org.spout.engine.world.SpoutChunk;
-import org.spout.engine.world.SpoutChunkSnapshot;
-import org.spout.engine.world.SpoutWorld;
-
-import com.beust.jcommander.JCommander;
-import com.beust.jcommander.Parameter;
+import org.spout.engine.input.SpoutInput;
+import org.spout.engine.listener.SpoutClientListener;
+import org.spout.engine.listener.channel.SpoutClientConnectListener;
+import org.spout.engine.player.SpoutClientPlayer;
+import org.spout.engine.player.SpoutPlayer;
+import org.spout.engine.protocol.SpoutClientSession;
+import org.spout.engine.renderer.WorldRenderer;
+import org.spout.engine.util.MacOSXUtils;
+import org.spout.engine.util.thread.threadfactory.NamedThreadFactory;
+import org.spout.engine.world.SpoutClientWorld;
 
 public class SpoutClient extends SpoutEngine implements Client {
+	private final SoundManager soundManager = new SpoutSoundManager();
+	private final Input inputManager = new SpoutInput();
 	private final String name = "Spout Client";
-
-	private Camera activeCamera;
-	private final Vector2 resolution = new Vector2(854, 480);
+	private final Vector2 resolution = new Vector2(640, 480);
+	private final boolean[] sides = { true, true, true, true, true, true };
 	private final float aspectRatio = resolution.getX() / resolution.getY();
 
-	private ScreenStack screenStack;
+	private Camera activeCamera;
+	private WorldRenderer worldRenderer;
 
-	@Parameter(names = "-Rendermode", converter = RenderModeConverter.class, description = "Render Version.  Versions: GL11, GL20, GL30, GLES20" )
-	RenderMode rmode = RenderMode.GL30;
+	private final AtomicReference<SpoutClientSession> session = new AtomicReference<SpoutClientSession>();
+	private SpoutPlayer activePlayer;
+	private final AtomicReference<SpoutClientWorld> activeWorld = new AtomicReference<SpoutClientWorld>();
+	private final AtomicReference<PortBinding> potentialBinding = new AtomicReference<PortBinding>();
 
+	// Handle stopping
+	private volatile boolean rendering = true;
+	private String stopMessage = null;
+	private final ClientBootstrap bootstrap = new ClientBootstrap();
 
-	TInt21TripleObjectHashMap<PrimitiveBatch> chunkRenderers = new TInt21TripleObjectHashMap<PrimitiveBatch>();
+	public SpoutClient() {
+		this.filesystem = new ClientFileSystem();
+	}
 
-	RenderMaterial material;
-
-	public static void main(String[] args) {
+	@Override
+	public void init(SpoutApplication args) {
 		boolean inJar = false;
 
 		try {
@@ -110,296 +132,48 @@ public class SpoutClient extends SpoutEngine implements Client {
 		if (inJar) {
 			unpackLwjgl();
 		}
+		ExecutorService executorBoss = Executors.newCachedThreadPool(new NamedThreadFactory("SpoutServer - Boss", true));
+		ExecutorService executorWorker = Executors.newCachedThreadPool(new NamedThreadFactory("SpoutServer - Worker", true));
+		ChannelFactory factory = new NioClientSocketChannelFactory(executorBoss, executorWorker);
+		bootstrap.setFactory(factory);
 
-		SpoutClient c = new SpoutClient();
-		Spout.setEngine(c);
-		Spout.getFilesystem().init();
-		new JCommander(c, args);
-		c.init(args);
-		c.start();
-	}
-
-	public SpoutClient() {
-		this.filesystem = new ClientFileSystem();
-	}
-
-	@Override
-	public void init(String[] args) {
+		ChannelPipelineFactory pipelineFactory = new CommonPipelineFactory(this);
+		bootstrap.setPipelineFactory(pipelineFactory);
 		super.init(args);
-		
+
+		scheduler.startRenderThread();
+
 	}
-	
+
 	@Override
 	public void start() {
 		start(false);
+		Protocol.registerProtocol(new SpoutClientProtocol());
 	}
 
 	@Override
 	public void start(boolean checkWorlds) {
 		super.start(checkWorlds);
-		scheduler.startRenderThread();
-		
-	}
+			getEventManager().registerEvents(new SpoutClientListener(this), this);
+		CommandRegistrationsFactory<Class<?>> commandRegFactory = new AnnotatedCommandRegistrationFactory(new SimpleInjector(this));
 
-	VertexBufferImpl buffer;
-	
-	public void initRenderer() {
-		createWindow();
-		
-		System.out.println("SpoutClient Information");
-		System.out.println("Operating System: " + System.getProperty("os.name"));
-		System.out.println("Renderer Mode: " + this.getRenderMode().toString());
-		System.out.println("OpenGL Information");
-		System.out.println("Vendor: " + GL11.glGetString(GL11.GL_VENDOR));
-		System.out.println("OpenGL Version: " + GL11.glGetString(GL11.GL_VERSION));
-		System.out.println("GLSL Version: " + GL11.glGetString(GL20.GL_SHADING_LANGUAGE_VERSION));
-		String extensions = "Extensions Supported: ";
-		if(rmode == RenderMode.GL30){
-			for (int i = 0; i < GL11.glGetInteger(GL30.GL_NUM_EXTENSIONS); i++) {
-				extensions += GL30.glGetStringi(GL11.GL_EXTENSIONS, i) + " ";
-			}
-		}
-		else{
-			extensions += GL11.glGetString(GL11.GL_EXTENSIONS);
-		}
-		System.out.println(extensions);
-
-		Spout.getFilesystem().postStartup();
-		
-		
-		activeCamera = new BasicCamera(MathHelper.createPerspective(75, aspectRatio, 0.001f, 1000), MathHelper.createLookAt(new Vector3(0, 0, -2), Vector3.ZERO, Vector3.UP));
-		renderer = new PrimitiveBatch();
-	
-		GL11.glEnable(GL11.GL_DEPTH_TEST);
-		Spout.log("Loading Texture");
-		textureTest = (BatchVertexRenderer) BatchVertexRenderer.constructNewBatch(GL11.GL_TRIANGLES);
-		Spout.log("Loading Material");
-		material = (RenderMaterial) Spout.getFilesystem().getResource("material://Vanilla/resources/materials/terrain.smt");
-		
-		
-		buffer = new VertexBufferImpl();
-		vbBatch = new VertexBufferBatcher(GL11.GL_TRIANGLES, buffer);
-	
-	
-		//graphics = new Graphics(Display.getWidth(), Display.getHeight());
-
-		//screenStack = new ScreenStack(new LoadingScreen());
-		//bunny = (BaseMesh) FileSystem.getResource("mesh://Vanilla/bunny.obj");
-	}
-	VertexBufferBatcher vbBatch;
-	BaseMesh bunny;
-
-	private void createWindow(){
-		try {
-			Display.setDisplayMode(new DisplayMode((int) resolution.getX(), (int) resolution.getY()));
-
-
-			if (System.getProperty("os.name").toLowerCase().contains("mac")) {
-				createMacWindow();
-
-			} else {
-				if(rmode == RenderMode.GL11){
-					ContextAttribs ca = new ContextAttribs(1, 5);
-					Display.create(new PixelFormat(8, 24, 0), ca);
-				} else if (rmode == RenderMode.GL20){
-					ContextAttribs ca = new ContextAttribs(2, 1);
-					Display.create(new PixelFormat(8, 24, 0), ca);
-				}else if(rmode == RenderMode.GL30){
-
-					ContextAttribs ca = new ContextAttribs(3, 2).withForwardCompatible(false);
-					Display.create(new PixelFormat(8, 24, 0), ca);
-				}
-			}
-
-			Display.setTitle("Spout Client");
-
-		} catch (LWJGLException e) {
-			// TODO Auto-generated catch block
-			e.printStackTrace();
-		}
-
-
-
-	}
-
-
-	private void createMacWindow() throws LWJGLException{
-
-		String[] ver = System.getProperty("os.version").split("\\.");
-
-		if(this.rmode == RenderMode.GL30){
-			if (Integer.parseInt(ver[1]) >= 7) {
-				ContextAttribs ca = new ContextAttribs(3, 2).withProfileCore(true);
-				Display.create(new PixelFormat(8, 24, 0), ca);
-			} else {
-				throw new UnsupportedOperationException("Cannot create a 3.0 context without OSX 10.7_");
-			}
-
-		}else {
-			Display.create();
-		}
-
-
-	}
-
-
-	Texture texture;
-	PrimitiveBatch renderer;
-	final boolean[] sides = {true, true, true, true, true, true};
-	long ticks = 0;
-	BatchVertexRenderer textureTest;
-	//Graphics graphics;
-
-
-	public void render(float dt) {
-		glClear(GL_COLOR_BUFFER_BIT | GL_DEPTH_BUFFER_BIT);
-		GL11.glClearColor(1, 1, 1, 0);
-
-		ticks++;
-
-		double cx = 2 * Math.sin(Math.toRadians(ticks));
-		double cz = 2 * Math.cos(Math.toRadians(ticks));
-		double cy = 2 * Math.sin(Math.toRadians(ticks));
-
-		Matrix view = MathHelper.createLookAt(new Vector3(cx, cy, cz), Vector3.ZERO, Vector3.UP);
-		
-		vbBatch.begin(material);
-		vbBatch.addTexCoord(0, 0);
-		vbBatch.addVertex(0, 0);
-		vbBatch.addTexCoord(1, 0);
-		vbBatch.addVertex(1, 0);
-		vbBatch.addTexCoord(0, 1);
-		vbBatch.addVertex(0, 1);
-
-		vbBatch.addTexCoord(0, 1);
-		vbBatch.addVertex(0, 1);
-		vbBatch.addTexCoord(1, 1);
-		vbBatch.addVertex(1, 1);
-		vbBatch.addTexCoord(1, 0);
-		vbBatch.addVertex(1, 0);
-		
-		vbBatch.end();
-		
-		material.getShader().setUniform("View", view);
-		material.getShader().setUniform("Projection", activeCamera.getProjection());
-		buffer.drawBuffer(material);
-		//renderer.getRenderer().getShader().setUniform("View", view);
-		//renderer.getRenderer().getShader().setUniform("Projection", activeCamera.getProjection());
-		//renderer.begin();
-		//renderer.addCube(Vector3.ZERO,Vector3.ONE, Color.RED, sides);
-		//renderer.addMesh(bunny);
-		//((BatchVertexRenderer)renderer.getRenderer()).dumpBuffers();
-		//renderer.end();
-		
-		//renderer.draw();
-
-	
-		textureTest.begin(material);
-		textureTest.getShader().setUniform("View", view);
-		textureTest.getShader().setUniform("Projection", activeCamera.getProjection());
-		textureTest.addTexCoord(0, 0);
-		textureTest.addVertex(4, 4);
-		textureTest.addTexCoord(1, 0);
-		textureTest.addVertex(5, 4);
-		textureTest.addTexCoord(0, 1);
-		textureTest.addVertex(4, 5);
-
-		textureTest.addTexCoord(0, 1);
-		textureTest.addVertex(4, 5);
-		textureTest.addTexCoord(1, 1);
-		textureTest.addVertex(5, 5);
-		textureTest.addTexCoord(1, 0);
-		textureTest.addVertex(5, 4);
-		textureTest.end();
-		textureTest.render();
-		
-		/*
-		Object[] worlds = this.getLiveWorlds().toArray();
-		SpoutWorld world = (SpoutWorld)worlds[0];
-		renderVisibleChunks(world);
-		
-		
-	
-		for(Object b : chunkRenderers.values()){
-			PrimitiveBatch batch = (PrimitiveBatch)b;
-			batch.getRenderer().getShader().setUniform("View", view);
-			batch.getRenderer().getShader().setUniform("Projection", activeCamera.getProjection());
-			Spout.log("Drawing: " + batch.getRenderer().getVertexCount() + " Verticies");
-			batch.draw();
-		}
-	*/
-
-	}
-
-	@SuppressWarnings("unused")
-	private void renderVisibleChunks(SpoutWorld world) {
-		
-		for (int x = -1; x < 1; x++) {
-			for (int y = 0; y < 5; y++) {
-				for (int z = -1; z < 1; z++) {
-					SpoutChunk c = world.getChunk(x, y, z);
-					ChunkSnapshot snap = c.getSnapshot();
-					buildChunk((SpoutChunkSnapshot)snap);
-				}
-			}
-		}
-		
-	}
-
-	private void buildChunk(SpoutChunkSnapshot snap) {
-		boolean firstSeen = !chunkRenderers.containsKey(snap.getX(), snap.getY(), snap.getZ());
-		/*if(!firstSeen && !snap.isRenderDirty()){
-			Spout.log("Got a chunk that isn't dirty or i've seen it before");
-			return;
-		}*/
-
-		if(firstSeen){
-			PrimitiveBatch b = new PrimitiveBatch();
-			//b.getRenderer().setShader(shader);
-			chunkRenderers.put(snap.getX(), snap.getY(), snap.getZ(), b);
-			Spout.log("Got a new chunk at " + snap.toString());
-		}		
-		
-		PrimitiveBatch batch = chunkRenderers.get(snap.getX(), snap.getY(), snap.getZ());
-		//batch.begin();
-		for (int x = 0; x < ChunkSnapshot.CHUNK_SIZE; x++) {
-			for (int y = 0; y < ChunkSnapshot.CHUNK_SIZE; y++) {
-				for (int z = 0; z < ChunkSnapshot.CHUNK_SIZE; z++) {
-					BlockMaterial m = snap.getBlockMaterial(x, y, z);
-					
-					Color col = getColor(m);
-					if (m.isSolid()) {
-						batch.addCube(new Vector3(x, y, z), Vector3.ONE, col, sides);
-					}
-				}
-			}
-		}
-		batch.end();
-		snap.setRenderDirty(false); //Rendered this snapshot
+		// Register commands
+		getRootCommand().addSubCommands(this, InputCommands.class, commandRegFactory);
+		activePlayer = new SpoutClientPlayer("Spouty", this);
 	}
 
 	@Override
-	public File getTemporaryCache() {
-		// TODO Auto-generated method stub
-		return null;
+	public SpoutPlayer getActivePlayer() {
+		return activePlayer;
 	}
 
 	@Override
-	public File getStatsFolder() {
-		// TODO Auto-generated method stub
-		return null;
-	}
-
-	@Override
-	public Entity getActivePlayer() {
-		// TODO Auto-generated method stub
-		return null;
-	}
-
-	@Override
-	public World getWorld() {
-		// TODO Auto-generated method stub
-		return null;
+	public CommandSource getCommandSource() {
+		if (session.get() != null) {
+			return activePlayer;
+		} else {
+			return super.getCommandSource();
+		}
 	}
 
 	@Override
@@ -419,55 +193,13 @@ public class SpoutClient extends SpoutEngine implements Client {
 	}
 
 	@Override
-	public File getResourcePackFolder() {
-		// TODO Auto-generated method stub
-		return null;
-	}
-
-	private Color getColor(BlockMaterial m) {
-		if (!m.isSolid()) {
-			return new Color(0, 0, 0);
-		}
-		switch (m.getId()) {
-			case 78:
-				return new Color(255, 255, 255);
-			case 24:
-			case 12:
-				return new Color(210, 210, 150);
-			case 10:
-				return new Color(200, 50, 50);
-			case 9:
-			case 8:
-				return new Color(150, 150, 200);
-			case 7:
-				return new Color(50, 50, 50);
-			case 4:
-				return new Color(100, 100, 100);
-			case 17:
-			case 3:
-				return new Color(110, 75, 35);
-			case 18:
-			case 2:
-				return new Color(55, 140, 55);
-			case 21:
-			case 16:
-			case 15:
-			case 14:
-			case 13:
-			case 1:
-			default:
-				return new Color(150, 150, 150);
-		}
-	}
-	
-	@Override
 	public Platform getPlatform() {
 		return Platform.CLIENT;
 	}
 
 	@Override
 	public RenderMode getRenderMode() {
-		return rmode;
+		return getArguments().renderMode;
 	}
 
 	@Override
@@ -476,43 +208,215 @@ public class SpoutClient extends SpoutEngine implements Client {
 	}
 
 	@Override
-	public ScreenStack getScreenStack() {
-		return screenStack;
+	public SoundManager getSoundManager() {
+		return soundManager;
+	}
+
+	@Override
+	public Input getInput() {
+		return inputManager;
+	}
+
+	@Override
+	public PortBinding getAddress() {
+		return session.get().getActiveAddress();
+	}
+
+	@Override
+	public boolean stop(String message) {
+		if (!super.stop(message, false)) {
+			return false;
+		}
+		rendering = false;
+		stopMessage = message;
+		Runnable finalTask = new Runnable() {
+			public void run() {
+				bootstrap.getFactory().releaseExternalResources();
+				boundProtocols.clear();
+			}
+		};
+		scheduler.submitFinalTask(finalTask);
+		scheduler.stop(1);
+		return true;
+	}
+
+	public boolean isRendering() {
+		return rendering;
+	}
+
+	public void stopEngine() {
+		if (rendering) {
+			throw new IllegalStateException("Client is still rendering!");
+		}
+		super.stop(stopMessage);
+	}
+
+	@Override
+	public SpoutClientWorld getWorld(String name, boolean exact) {
+		SpoutClientWorld world = activeWorld.get();
+		if (world == null) {
+			return null;
+		}
+
+		if ((exact && world.getName().equals(name))
+				|| world.getName().startsWith(name)) {
+			return world;
+		} else {
+			return null;
+		}
+	}
+
+	@Override
+	public SpoutClientWorld getWorld(UUID uid) {
+		SpoutClientWorld world = activeWorld.get();
+		if (world != null && world.getUID().equals(uid)) {
+			return world;
+		} else {
+			return null;
+		}
+	}
+
+	@Override
+	public Collection<World> getWorlds() {
+		return Collections.<World>singletonList(activeWorld.get());
+	}
+
+	@Override
+	public SpoutClientWorld getDefaultWorld() {
+		return activeWorld.get();
+	}
+
+	public SpoutClientWorld worldChanged(String name, UUID uuid, byte[] datatable) {
+		SpoutClientWorld world = new SpoutClientWorld(name, uuid, this, datatable);
+		SpoutClientWorld oldWorld = activeWorld.getAndSet(world);
+		try {
+			if (oldWorld != null) {
+				oldWorld.haltRun();
+			}
+		} catch (InterruptedException e) {
+		}
+		return world;
+	}
+
+	public ClientBootstrap getBootstrap() {
+		return bootstrap;
+	}
+
+	@Override
+	public SpoutClientSession newSession(Channel channel) {
+		Protocol protocol = potentialBinding.getAndSet(null).getProtocol();
+		return new SpoutClientSession(this, channel, protocol);
+	}
+
+	public void connect(final PortBinding binding) {
+		potentialBinding.set(binding);
+		getBootstrap().connect(binding.getAddress()).addListener(new SpoutClientConnectListener(this, binding));
+	}
+
+	public void disconnected() {
+		Session sess = this.session.getAndSet(null);
+		if (sess != null) {
+			getSessionRegistry().remove(sess);
+		}
+	}
+
+	public void setSession(SpoutClientSession session) {
+		this.session.set(session);
+		getSessionRegistry().add(session);
+		activePlayer.connect(session, null);
+		session.setPlayer(activePlayer);
+	}
+
+	public void initRenderer() {
+		createWindow();
+
+		getLogger().info("SpoutClient Information");
+		getLogger().info("Operating System: " + System.getProperty("os.name"));
+		getLogger().info("Renderer Mode: " + this.getRenderMode().toString());
+		getLogger().info("OpenGL Information");
+		getLogger().info("Vendor: " + GL11.glGetString(GL11.GL_VENDOR));
+		getLogger().info("OpenGL Version: " + GL11.glGetString(GL11.GL_VERSION));
+		getLogger().info("GLSL Version: " + GL11.glGetString(GL20.GL_SHADING_LANGUAGE_VERSION));
+		getLogger().info("Max Textures: " + GL11.glGetString(GL20.GL_MAX_COMBINED_TEXTURE_IMAGE_UNITS));
+		String extensions = "Extensions Supported: ";
+		if (getArguments().renderMode == RenderMode.GL30) {
+			for (int i = 0; i < GL11.glGetInteger(GL30.GL_NUM_EXTENSIONS); i++) {
+				extensions += GL30.glGetStringi(GL11.GL_EXTENSIONS, i) + " ";
+			}
+		} else {
+			extensions += GL11.glGetString(GL11.GL_EXTENSIONS);
+		}
+		getLogger().info(extensions);
+
+		soundManager.init();
+		Spout.getFilesystem().postStartup();
+
+		activeCamera = new BasicCamera(MathHelper.createPerspective(75, aspectRatio, 0.001f, 1000), MathHelper.createLookAt(new Vector3(0, 50, 100), Vector3.ZERO, Vector3.UP));
+		activeCamera.getFrustum().update(activeCamera.getProjection(), activeCamera.getView());
+
+		GL11.glEnable(GL11.GL_DEPTH_TEST);
+		GL11.glClearColor((135.f/255.0f), 206.f/255.f, 250.f/255.f, 0);
+
+		worldRenderer = new WorldRenderer(this);
+		worldRenderer.setup();
+	}
+
+	public void render(float dt) {
+		glClear(GL_COLOR_BUFFER_BIT | GL_DEPTH_BUFFER_BIT);
+
+		worldRenderer.render();
+	}
+
+	private void createWindow() {
+		try {
+			Display.setDisplayMode(new DisplayMode((int) resolution.getX(), (int) resolution.getY()));
+
+			if (MacOSXUtils.isMac()) {
+				createMacWindow();
+			} else {
+				if (getRenderMode() == RenderMode.GL11) {
+					ContextAttribs ca = new ContextAttribs(1, 5);
+					Display.create(new PixelFormat(8, 24, 0), ca);
+				} else if (getRenderMode() == RenderMode.GL20) {
+					ContextAttribs ca = new ContextAttribs(2, 1);
+					Display.create(new PixelFormat(8, 24, 0), ca);
+				} else if (getRenderMode() == RenderMode.GL30) {
+					ContextAttribs ca = new ContextAttribs(3, 2).withForwardCompatible(false);
+					Display.create(new PixelFormat(8, 24, 0), ca);
+				}
+			}
+
+			Display.setTitle("Spout Client");
+		} catch (LWJGLException e) {
+			e.printStackTrace();
+		}
+	}
+
+	private void createMacWindow() throws LWJGLException {
+		if (getRenderMode() == RenderMode.GL30) {
+			if (MacOSXUtils.getOSXVersion() >= 7) {
+				ContextAttribs ca = new ContextAttribs(3, 2).withProfileCore(true);
+				Display.create(new PixelFormat(8, 24, 0), ca);
+			} else {
+				throw new UnsupportedOperationException("Cannot create a 3.0 context without OSX 10.7_");
+			}
+		} else {
+			Display.create();
+		}
 	}
 
 	private static void unpackLwjgl() {
-		String[] files = null;
-		String osPath = "";
+		String[] files;
+		String osPath;
 
-		if(SystemUtils.IS_OS_WINDOWS) {
-			files = new String[] {
-					"jinput-dx8_64.dll",
-					"jinput-dx8.dll",
-					"jinput-raw_64.dll",
-					"jinput-raw.dll",
-					"jinput-wintab.dll",
-					"lwjgl.dll",
-					"lwjgl64.dll",
-					"OpenAL32.dll",
-					"OpenAL64.dll"
-			};
+		if (SystemUtils.IS_OS_WINDOWS) {
+			files = new String[] { "jinput-dx8_64.dll", "jinput-dx8.dll", "jinput-raw_64.dll", "jinput-raw.dll", "jinput-wintab.dll", "lwjgl.dll", "lwjgl64.dll", "OpenAL32.dll", "OpenAL64.dll" };
 			osPath = "windows/";
 		} else if (SystemUtils.IS_OS_MAC) {
-			files = new String[] {
-					"libjinput-osx.jnilib",
-					"liblwjgl.jnilib",
-					"openal.dylib",
-			};
+			files = new String[] { "libjinput-osx.jnilib", "liblwjgl.jnilib", "openal.dylib", };
 			osPath = "mac/";
-		} else if(SystemUtils.IS_OS_LINUX) {
-			files = new String[] {
-					"liblwjgl.so",
-					"liblwjgl64.so",
-					"libopenal.so",
-					"libopenal64.so",
-					"libjinput-linux.so",
-					"libjinput-linux64.so"
-			};
+		} else if (SystemUtils.IS_OS_LINUX) {
+			files = new String[] { "liblwjgl.so", "liblwjgl64.so", "libopenal.so", "libopenal64.so", "libjinput-linux.so", "libjinput-linux64.so" };
 			osPath = "linux/";
 		} else {
 			Spout.getEngine().getLogger().log(Level.SEVERE, "Error loading natives of operating system type: " + SystemUtils.OS_NAME);
@@ -536,11 +440,4 @@ public class SpoutClient extends SpoutEngine implements Client {
 		System.setProperty("org.lwjgl.librarypath", nativePath);
 		System.setProperty("net.java.games.input.librarypath", nativePath);
 	}
-
-	@Override
-	public void stop() {
-		Display.destroy();
-		super.stop();
-	}
-
 }

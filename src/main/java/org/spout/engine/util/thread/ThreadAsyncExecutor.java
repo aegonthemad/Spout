@@ -153,18 +153,24 @@ public final class ThreadAsyncExecutor extends PulsableThread implements AsyncEx
 	}
 	
 	@Override
-	public final boolean doLocalPhysics() {
+	public final boolean doPhysics(int sequence) {
 		ThreadsafetyManager.checkMainThread();
+		physicsTask.setSequence(sequence);
 		taskQueue.add(physicsTask);
 		return pulse();
 	}
 	
 	@Override
-	public final boolean doLocalDynamicUpdates(long time) {
-		ThreadsafetyManager.checkMainThread();
-		dynamicUpdatesTask.setTime(time);
-		taskQueue.add(dynamicUpdatesTask);
-		return pulse();
+	public final boolean doDynamicUpdates(long time, int sequence) {
+		if (sequence == -1 || sequence == manager.getSequence()) {
+			ThreadsafetyManager.checkMainThread();
+			dynamicUpdatesTask.setTime(time);
+			dynamicUpdatesTask.setSequence(sequence);
+			taskQueue.add(dynamicUpdatesTask);
+			return pulse();
+		} else {
+			return true;
+		}
 	}
 	
 	@Override
@@ -178,7 +184,7 @@ public final class ThreadAsyncExecutor extends PulsableThread implements AsyncEx
 	public final boolean isPulseFinished() {
 		try {
 			disableWake();
-			return (wakeCounter.getAndAdd(0) & wakePulsing) == 0 && !isPulsing() && taskQueue.isEmpty();
+			return (wakeCounter.getAndAdd(0) & wakePulsing) == 0 && !isPulsing() && taskQueue.isEmpty() || !isAlive();
 		} finally {
 			enableWake();
 		}

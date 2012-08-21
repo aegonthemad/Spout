@@ -27,15 +27,24 @@
 package org.spout.engine.entity;
 
 import java.util.Collection;
+import java.util.Collections;
+import java.util.HashMap;
 import java.util.HashSet;
 import java.util.Iterator;
+import java.util.Map;
 import java.util.Set;
 import java.util.concurrent.ConcurrentHashMap;
 import java.util.concurrent.atomic.AtomicInteger;
 
+import org.spout.api.Spout;
 import org.spout.api.datatable.GenericDatatableMap;
+import org.spout.api.entity.Entity;
 import org.spout.api.entity.component.Controller;
+import org.spout.api.entity.component.controller.BlockController;
 import org.spout.api.entity.component.controller.PlayerController;
+import org.spout.api.event.entity.EntityDespawnEvent;
+import org.spout.api.event.entity.EntitySpawnEvent;
+import org.spout.api.math.Vector3;
 import org.spout.api.player.Player;
 import org.spout.api.util.StringMap;
 
@@ -67,6 +76,8 @@ public class EntityManager implements Iterable<SpoutEntity> {
 	 */
 	private final static AtomicInteger nextId = new AtomicInteger(1);
 	private final StringMap entityMap = GenericDatatableMap.getStringMap();
+
+	private final Map<Vector3, Entity> blockEntities = new HashMap<Vector3, Entity>();
 
 	private SnapshotableHashSet<SpoutEntity> getRawAll(Class<? extends Controller> type) {
 		SnapshotableHashSet<SpoutEntity> set = groupedEntities.get(type);
@@ -138,12 +149,15 @@ public class EntityManager implements Iterable<SpoutEntity> {
 	 * Allocates the id for an entity.
 	 *
 	 * @param entity The entity.
-	 * @param region to allocate the entity for
 	 * @return The id.
 	 */
 	public int allocate(SpoutEntity entity, SpoutRegion region) {
+		EntitySpawnEvent event = new EntitySpawnEvent(entity, entity.getPosition());
+		Spout.getEngine().getEventManager().callEvent(event);
+		if (event.isCancelled()) {
+			return -1; //TODO correct?
+		}
 		int currentId = entity.getId();
-		SpoutRegion entityRegion = region == null ? ((SpoutRegion) entity.getRegion()) : region;
 		if (currentId == SpoutEntity.NOTSPAWNEDID) {
 			currentId = nextId.getAndIncrement();
 			if (currentId == -2) {
@@ -152,15 +166,7 @@ public class EntityManager implements Iterable<SpoutEntity> {
 			entity.setId(currentId);
 		}
 		entities.put(currentId, entity);
-		entity.setOwningThread(entityRegion.getExceutionThread());
-
-		if (entity.getController() != null) {
-			getRawAll(entity.getController().getClass()).add(entity);
-			if (entity.getController() instanceof PlayerController) {
-				players.add((PlayerController)entity.getController());
-			}
-		}
-
+		entity.setOwningThread(region.getExceutionThread());
 		return currentId;
 	}
 
@@ -170,12 +176,48 @@ public class EntityManager implements Iterable<SpoutEntity> {
 	 * @param entity The entity.
 	 */
 	public void deallocate(SpoutEntity entity) {
+		EntityDespawnEvent event = new EntityDespawnEvent(entity);
+		Spout.getEngine().getEventManager().callEvent(event);
+		if (event.isCancelled()) {
+			return;
+		}
 		entities.remove(entity.getId());
+		//Players are never removed (offline concept), instead set their ID back to -1 to be reallocated.
+		if (entity instanceof Player) {
+			entity.setId(SpoutEntity.NOTSPAWNEDID);
+		}
+	}
+
+	public void addEntity(SpoutEntity entity, SpoutRegion region) {
+		allocate(entity, region);
+		if (entity.getController() != null) {
+			getRawAll(entity.getController().getClass()).add(entity);
+			Controller c = entity.getController();
+			if (c instanceof PlayerController) {
+				players.add((PlayerController) c);
+			} else if (c instanceof BlockController) {
+				Vector3 pos = entity.getPosition().floor();
+				Entity old = blockEntities.put(pos, entity);
+				if (old != null) {
+					old.kill();
+				}
+			}
+		}
+	}
+
+	public void removeEntity(SpoutEntity entity) {
+		deallocate(entity);
 		Controller controller = entity.getController();
 		if (controller != null) {
 			getRawAll(entity.getController().getClass()).remove(entity);
 			if (controller instanceof PlayerController) {
 				players.remove((PlayerController)controller);
+			} else if (controller instanceof BlockController) {
+				Vector3 pos = entity.getPosition().floor();
+				Entity be = blockEntities.get(pos);
+				if (be == entity) {
+					blockEntities.remove(pos);
+				}
 			}
 		}
 	}
@@ -209,7 +251,7 @@ public class EntityManager implements Iterable<SpoutEntity> {
 				continue;
 			}
 
-			Player p = ((PlayerController) controller).getPlayer();
+			Player p = ((PlayerController) controller).getParent();
 			if (p.isOnline()) {
 				p.getNetworkSynchronizer().finalizeTick();
 			}
@@ -222,7 +264,7 @@ public class EntityManager implements Iterable<SpoutEntity> {
 			if (controller != null) {
 				controller.preSnapshot();
 				if (controller instanceof PlayerController) {
-					Player p = ((PlayerController) controller).getPlayer();
+					Player p = ((PlayerController) controller).getParent();
 					if (p.isOnline()) {
 						p.getNetworkSynchronizer().preSnapshot();
 					}
@@ -256,5 +298,9 @@ public class EntityManager implements Iterable<SpoutEntity> {
 	 */
 	public SpoutRegion getRegion() {
 		return null;
+	}
+
+	public Map<Vector3, Entity> getBlockEntities() {
+		return Collections.unmodifiableMap(blockEntities);
 	}
 }

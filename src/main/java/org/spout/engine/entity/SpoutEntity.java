@@ -26,7 +26,6 @@
  */
 package org.spout.engine.entity;
 
-import java.util.ArrayList;
 import java.util.HashSet;
 import java.util.Set;
 import java.util.UUID;
@@ -35,10 +34,9 @@ import java.util.concurrent.atomic.AtomicInteger;
 import java.util.concurrent.atomic.AtomicReference;
 
 import org.spout.api.Source;
-import org.spout.api.Spout;
 import org.spout.api.collision.CollisionModel;
 import org.spout.api.entity.Entity;
-import org.spout.api.entity.EntityComponent;
+import org.spout.api.entity.component.ComponentEntityBase;
 import org.spout.api.entity.component.Controller;
 import org.spout.api.entity.component.controller.PlayerController;
 import org.spout.api.event.entity.EntityControllerChangeEvent;
@@ -50,11 +48,11 @@ import org.spout.api.geo.discrete.Point;
 import org.spout.api.geo.discrete.Transform;
 import org.spout.api.math.IntVector3;
 import org.spout.api.math.MathHelper;
+import org.spout.api.math.Matrix;
 import org.spout.api.math.Quaternion;
 import org.spout.api.math.Vector3;
 import org.spout.api.model.Model;
 import org.spout.api.player.Player;
-import org.spout.api.tickable.Tickable;
 import org.spout.api.util.OutwardIterator;
 import org.spout.api.util.Profiler;
 import org.spout.engine.SpoutConfiguration;
@@ -62,20 +60,20 @@ import org.spout.engine.SpoutEngine;
 import org.spout.engine.world.SpoutChunk;
 import org.spout.engine.world.SpoutRegion;
 
-public class SpoutEntity extends Tickable implements Entity {
+public class SpoutEntity extends ComponentEntityBase implements Entity {
 	public static final int NOTSPAWNEDID = -1;
 	//Thread-safe
 	private final AtomicReference<EntityManager> entityManagerLive;
 	private final AtomicReference<Controller> controllerLive;
 	private final AtomicReference<Chunk> chunkLive;
-	private final ArrayList<AtomicReference<EntityComponent>> components = new ArrayList<AtomicReference<EntityComponent>>();
 	private final AtomicBoolean observerLive = new AtomicBoolean(false);
 	private final AtomicInteger id = new AtomicInteger();
 	private final AtomicInteger viewDistanceLive = new AtomicInteger();
 	private final Transform transform = new Transform();
 	private final Set<SpoutChunk> observingChunks = new HashSet<SpoutChunk>();
+	private final SpoutEngine engine;
 	private final UUID uid;
-	private boolean justSpawned = true;
+	protected boolean justSpawned = true;
 	private boolean observer = false;
 	private boolean attached = false;
 	private int viewDistance;
@@ -90,6 +88,7 @@ public class SpoutEntity extends Tickable implements Entity {
 	public SpoutEntity(SpoutEngine engine, Transform transform, Controller controller, int viewDistance, UUID uid, boolean load) {
 		id.set(NOTSPAWNEDID);
 		this.transform.set(transform);
+		this.engine = engine;
 
 		if (uid != null) {
 			this.uid = uid;
@@ -148,13 +147,15 @@ public class SpoutEntity extends Tickable implements Entity {
 	public void onTick(float dt) {
 		Profiler.start("tick entity session");
 		Controller cont = controllerLive.get();
-
+		
+		super.onTick(dt);
+			
 		//Tick the controller
 		Profiler.startAndStop("tick entity controller");
 		if (cont != null) {
 			//Sanity check
 			if (cont.getParent() != this) {
-				if (Spout.debugMode()) {
+				if (engine.debugMode()) {
 					throw new IllegalStateException("Controller parent does not match entity");
 				}
 
@@ -163,7 +164,7 @@ public class SpoutEntity extends Tickable implements Entity {
 			//If this is the first tick, we need to attach the controller
 			//Controller is attached here instead of inside of the constructor
 			//because the constructor can not access getChunk if the entity is being deserialized
-			if (!attached) {
+			if (!attached && !isDead() && getPosition() != null && getWorld() != null) {
 				cont.onAttached();
 				attached = true;
 			}
@@ -388,9 +389,9 @@ public class SpoutEntity extends Tickable implements Entity {
 
 	private boolean activeThreadIsValid(String attemptedAction) {
 		Thread current = Thread.currentThread();
-		boolean invalidAccess = !(this.owningThread == current || Spout.getEngine().getMainThread() == current);
+		boolean invalidAccess = !(this.owningThread == current || engine.getMainThread() == current);
 
-		if (invalidAccess && Spout.getEngine().debugMode()) {
+		if (invalidAccess && engine.debugMode()) {
 			if (attemptedAction == null) {
 				attemptedAction = "Unknown Action";
 			}
@@ -420,7 +421,7 @@ public class SpoutEntity extends Tickable implements Entity {
 
 	@Override
 	public void setController(Controller controller, Source source) {
-		EntityControllerChangeEvent event = Spout.getEventManager().callEvent(new EntityControllerChangeEvent(this, source, controller));
+		EntityControllerChangeEvent event = engine.getEventManager().callEvent(new EntityControllerChangeEvent(this, source, controller));
 		Controller newController = event.getNewController();
 		controllerLive.set(controller);
 		if (newController != null) {
@@ -502,7 +503,7 @@ public class SpoutEntity extends Tickable implements Entity {
 
 		//Could be 1 of 3 scenarios:
 		//    1.) Entity is dead (ControllerLive == null)
-		//    2.) Entity is swapping controllers (ControllerLive != Controller, niether is null)
+		//    2.) Entity is swapping controllers (ControllerLive != Controller, neither is null)
 		//    3.) Entity has just spawned and has never executed copy snapshot, Controller == null, ControllerLive != null
 		if (controller != controllerLive.get()) {
 			//1.) Entity is dead
@@ -513,7 +514,7 @@ public class SpoutEntity extends Tickable implements Entity {
 				//Kill old controller
 				controller.onDeath();
 				if (controller instanceof PlayerController) {
-					Player p = ((PlayerController) controller).getPlayer();
+					Player p = ((PlayerController) controller).getParent();
 					if (p != null && p.isOnline()) {
 						p.getNetworkSynchronizer().onDeath();
 					}
@@ -524,7 +525,7 @@ public class SpoutEntity extends Tickable implements Entity {
 				//Kill old controller
 				controller.onDeath();
 				if (controller instanceof PlayerController) {
-					Player p = ((PlayerController) controller).getPlayer();
+					Player p = ((PlayerController) controller).getParent();
 					if (p != null && p.isOnline()) {
 						p.getNetworkSynchronizer().onDeath();
 					}
@@ -580,7 +581,7 @@ public class SpoutEntity extends Tickable implements Entity {
 	private void removeObserver() {
 		//Player view distance is handled in the network synchronizer
 		if (controllerLive.get() instanceof PlayerController) {
-			Player p = ((PlayerController)controllerLive.get()).getPlayer();
+			Player p = ((PlayerController)controllerLive.get()).getParent();
 			p.getNetworkSynchronizer().onDeath();
 			return;
 		}
@@ -712,26 +713,15 @@ public class SpoutEntity extends Tickable implements Entity {
 	}
 
 	@Override
-	public void attachComponent(EntityComponent component) {
-		component.attachToEntity(this);
-		component.onAttached();
-		components.add(new AtomicReference<EntityComponent>(component));
-	}
-
-	@Override
-	public void removeComponent(EntityComponent component) {
-		if (components.remove(component)) {
-			component.onDetached();
-		}
-	}
-
-	@Override
-	public boolean hasComponent(EntityComponent component) {
-		return components.contains(component);
-	}
-
-	@Override
 	public UUID getUID() {
 		return uid;
+	}
+
+	public Matrix getModelMatrix()
+	{
+		Matrix trans = MathHelper.translate(transform.getPosition());
+		Matrix rot = MathHelper.rotate(transform.getRotation());
+
+		return rot.multiply(trans);
 	}
 }

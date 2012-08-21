@@ -26,34 +26,50 @@
  */
 package org.spout.engine;
 
+import java.net.InetAddress;
 import java.net.SocketAddress;
+import java.net.UnknownHostException;
 import java.util.ArrayList;
 import java.util.Collection;
+import java.util.Collections;
 import java.util.List;
+import java.util.Map;
+import java.util.concurrent.ExecutorService;
+import java.util.concurrent.Executors;
 import java.util.logging.Level;
 
+import org.apache.commons.lang3.Validate;
 import org.jboss.netty.bootstrap.ServerBootstrap;
 import org.jboss.netty.channel.Channel;
 import org.jboss.netty.channel.ChannelFactory;
 import org.jboss.netty.channel.ChannelPipelineFactory;
-import org.jboss.netty.channel.socket.nio.NioServerSocketChannelFactory;
 import org.spout.api.Server;
-import org.spout.api.Spout;
+import org.spout.api.event.Listener;
+import org.spout.api.event.server.ServerStartEvent;
+import org.spout.api.exception.ConfigurationException;
 import org.spout.api.plugin.Platform;
 import org.spout.api.protocol.CommonPipelineFactory;
+import org.spout.api.protocol.PortBinding;
+import org.spout.api.protocol.Protocol;
 import org.spout.api.protocol.Session;
-import org.spout.api.protocol.bootstrap.BootstrapProtocol;
+import org.spout.api.protocol.builtin.SpoutServerProtocol;
 import org.spout.engine.filesystem.ServerFileSystem;
-import org.spout.engine.listener.SpoutListener;
-import org.spout.engine.protocol.SpoutSession;
+import org.spout.engine.listener.SpoutServerListener;
+import org.spout.engine.protocol.PortBindingImpl;
+import org.spout.engine.protocol.PortBindings;
+import org.spout.engine.protocol.SpoutNioServerSocketChannel;
+import org.spout.engine.protocol.SpoutServerSession;
 import org.spout.engine.util.bans.BanManager;
 import org.spout.engine.util.bans.FlatFileBanManager;
-
-import com.beust.jcommander.JCommander;
+import org.spout.engine.util.thread.threadfactory.NamedThreadFactory;
+import org.teleal.cling.UpnpService;
+import org.teleal.cling.UpnpServiceImpl;
+import org.teleal.cling.controlpoint.ControlPoint;
+import org.teleal.cling.support.igd.PortMappingListener;
+import org.teleal.cling.support.model.PortMapping;
 
 public class SpoutServer extends SpoutEngine implements Server {
 	private final String name = "Spout Server";
-
 	private volatile int maxPlayers = 20;
 	/**
 	 * If the server has a whitelist or not.
@@ -76,66 +92,106 @@ public class SpoutServer extends SpoutEngine implements Server {
 	 */
 	private final ServerBootstrap bootstrap = new ServerBootstrap();
 
+	/**
+	 * The UPnP service
+	 */
+	private UpnpService upnpService;
+
 	public SpoutServer() {
 		this.filesystem = new ServerFileSystem();
 	}
 
-	public static void main(String[] args) {
-		SpoutServer server = new SpoutServer();
-		Spout.setEngine(server);
-		Spout.getFilesystem().init();
-		new JCommander(server, args);
-		server.init(args);
-		server.start();
+	@Override
+	public void start() {
+		start(true);
+		Protocol.registerProtocol(new SpoutServerProtocol());
 	}
 
 	@Override
-	public void start() {
-		super.start();
-		
+	public void start(boolean checkWorlds) {
+		start(checkWorlds, new SpoutServerListener(this));
+	}
+
+	public void start(boolean checkWorlds, Listener listener) {
+		super.start(checkWorlds);
+
 		banManager = new FlatFileBanManager(this);
 
-		getEventManager().registerEvents(new SpoutListener(this), this);
-
+		getEventManager().registerEvents(listener, this);
+		getFilesystem().postStartup();
+		getEventManager().callEvent(new ServerStartEvent());
 		getLogger().info("Done Loading, ready for players.");
 	}
 
 	@Override
-	public void init(String[] args) {
+	protected void postPluginLoad() {
+		PortBindings portBindings = new PortBindings(this, config);
+		try {
+			portBindings.load(config);
+			portBindings.bindAll();
+			portBindings.save();
+		} catch (ConfigurationException e) {
+			getLogger().log(Level.SEVERE, "Error loading port bindings: " + e.getMessage(), e);
+		}
+
+		if (boundProtocols.size() == 0) {
+			getLogger().warning("No port bindings registered! Clients will not be able to connect to the server.");
+		}
+	}
+
+	@Override
+	public void init(SpoutApplication args) {
 		super.init(args);
-		ChannelFactory factory = new NioServerSocketChannelFactory(executor, executor);
+		//Note: All threads are daemons, cleanup of the executors is handled by bootstrap.getFactory().releaseExternalResources(); in stop(...).
+		ExecutorService executorBoss = Executors.newCachedThreadPool(new NamedThreadFactory("SpoutServer - Boss", true));
+		ExecutorService executorWorker = Executors.newCachedThreadPool(new NamedThreadFactory("SpoutServer - Worker", true));
+		ChannelFactory factory = new SpoutNioServerSocketChannel(executorBoss, executorWorker);
 		bootstrap.setFactory(factory);
+		bootstrap.setOption("tcpNoDelay", true);
+		bootstrap.setOption("keepAlive", true);
 
 		ChannelPipelineFactory pipelineFactory = new CommonPipelineFactory(this);
 		bootstrap.setPipelineFactory(pipelineFactory);
 	}
 
 	@Override
-	public void stop() {
-		super.stop();
-		bootstrap.getFactory().releaseExternalResources();
+	public boolean stop(String message) {
+		if (!super.stop(message, false)) {
+			return false;
+		}
+		Runnable finalTask = new Runnable() {
+			public void run() {
+				if (upnpService != null) {
+					upnpService.shutdown();
+				}
+				bootstrap.getFactory().releaseExternalResources();
+				boundProtocols.clear();
+			}
+		};
+		scheduler.submitFinalTask(finalTask);
+		scheduler.stop(1);
+		return true;
 	}
 
-	/**
-	 * Binds this server to the specified address.
-	 * @param address The addresss.
-	 */
 	@Override
-	public boolean bind(SocketAddress address, BootstrapProtocol protocol) {
-		if (protocol == null) {
+	public boolean bind(PortBinding binding) {
+		Validate.notNull(binding);
+		if (binding.getProtocol() == null) {
 			throw new IllegalArgumentException("Protocol cannot be null");
 		}
-		if (bootstrapProtocols.containsKey(address)) {
+
+		if (boundProtocols.containsKey(binding.getAddress())) {
 			return false;
 		}
-		bootstrapProtocols.put(address, protocol);
+		boundProtocols.put(binding.getAddress(), binding.getProtocol());
 		try {
-			group.add(bootstrap.bind(address));
+			group.add(bootstrap.bind(binding.getAddress()));
 		} catch (org.jboss.netty.channel.ChannelException ex) {
-			logger.log(Level.SEVERE, "Failed to bind to address " + address + ". Is there already another server running on this address?", ex);
+			getLogger().log(Level.SEVERE, "Failed to bind to address " + binding.getAddress() + ". Is there already another server running on this address?", ex);
 			return false;
 		}
-		logger.log(Level.INFO, "Binding to address: {0}...", address);
+
+		getLogger().log(Level.INFO, "Binding to address: {0}...", binding.getAddress());
 		return true;
 	}
 
@@ -153,6 +209,14 @@ public class SpoutServer extends SpoutEngine implements Server {
 	@Override
 	public boolean allowFlight() {
 		return allowFlight;
+	}
+
+	public List<PortBinding> getBoundAddresses() {
+		List<PortBinding> bindings = new ArrayList<PortBinding>();
+		for (Map.Entry<SocketAddress, Protocol> entry : boundProtocols.entrySet()) {
+			bindings.add(new PortBindingImpl(entry.getValue(), entry.getKey()));
+		}
+		return Collections.unmodifiableList(bindings);
 	}
 
 	@Override
@@ -197,7 +261,7 @@ public class SpoutServer extends SpoutEngine implements Server {
 	}
 
 	@Override
-	public void unWhitelist(String player) {
+	public void removeFromWhitelist(String player) {
 		whitelistedPlayers.remove(player);
 	}
 
@@ -207,12 +271,12 @@ public class SpoutServer extends SpoutEngine implements Server {
 	}
 
 	@Override
-	public void banIp(String address) {
+	public void banIP(String address) {
 		banManager.setIpBanned(address, true);
 	}
 
 	@Override
-	public void unbanIp(String address) {
+	public void unbanIP(String address) {
 		banManager.setIpBanned(address, false);
 	}
 
@@ -232,7 +296,7 @@ public class SpoutServer extends SpoutEngine implements Server {
 	}
 
 	@Override
-	public boolean isIpBanned(String address) {
+	public boolean isIPBanned(String address) {
 		return banManager.isIpBanned(address);
 	}
 
@@ -247,7 +311,7 @@ public class SpoutServer extends SpoutEngine implements Server {
 	}
 
 	@Override
-	public String getIpBanMessage(String address) {
+	public String getIPBanMessage(String address) {
 		return banManager.getIpBanMessage(address);
 	}
 
@@ -258,10 +322,10 @@ public class SpoutServer extends SpoutEngine implements Server {
 
 	@Override
 	public Session newSession(Channel channel) {
-		BootstrapProtocol protocol = getBootstrapProtocol(channel.getLocalAddress());
-		return new SpoutSession(this, channel, protocol);
+		Protocol protocol = getProtocol(channel.getLocalAddress());
+		return new SpoutServerSession<SpoutServer>(this, channel, protocol);
 	}
-	
+
 	@Override
 	public Platform getPlatform() {
 		return Platform.SERVER;
@@ -270,5 +334,68 @@ public class SpoutServer extends SpoutEngine implements Server {
 	@Override
 	public String getName() {
 		return name;
+	}
+
+	private UpnpService getUPnPService() {
+		if (upnpService == null) {
+			upnpService = new UpnpServiceImpl();
+		}
+
+		return upnpService;
+	}
+
+	private PortMapping createPortMapping(int port, PortMapping.Protocol protocol, String description) {
+		try {
+			return new PortMapping(port, InetAddress.getLocalHost().getHostAddress(), protocol, description);
+		} catch (UnknownHostException e) {
+			Error error = new Error("Error while trying to retrieve the localhost while creating a PortMapping object.", e);
+			getLogger().severe(e.getMessage());
+			throw error;
+		}
+	}
+
+	@Override
+	public void mapUPnPPort(int port) {
+		mapUPnPPort(port, null);
+	}
+
+	@Override
+	public void mapUPnPPort(int port, String description) {
+		PortMapping[] desiredMapping = {createPortMapping(port, PortMapping.Protocol.TCP, description), createPortMapping(port, PortMapping.Protocol.UDP, description)};
+		PortMappingListener listener = new PortMappingListener(desiredMapping);
+
+		ControlPoint controlPoint = getUPnPService().getControlPoint();
+		controlPoint.getRegistry().addListener(listener);
+		controlPoint.search();
+	}
+
+	@Override
+	public void mapTCPPort(int port) {
+		mapTCPPort(port, null);
+	}
+
+	@Override
+	public void mapTCPPort(int port, String description) {
+		PortMapping desiredMapping = createPortMapping(port, PortMapping.Protocol.TCP, description);
+		PortMappingListener listener = new PortMappingListener(desiredMapping);
+
+		ControlPoint controlPoint = getUPnPService().getControlPoint();
+		controlPoint.getRegistry().addListener(listener);
+		controlPoint.search();
+	}
+
+	@Override
+	public void mapUDPPort(int port) {
+		mapUDPPort(port, null);
+	}
+
+	@Override
+	public void mapUDPPort(int port, String description) {
+		PortMapping desiredMapping = createPortMapping(port, PortMapping.Protocol.UDP, description);
+		PortMappingListener listener = new PortMappingListener(desiredMapping);
+
+		ControlPoint controlPoint = getUPnPService().getControlPoint();
+		controlPoint.getRegistry().addListener(listener);
+		controlPoint.search();
 	}
 }

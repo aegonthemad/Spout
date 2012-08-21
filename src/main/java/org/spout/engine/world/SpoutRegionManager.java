@@ -71,27 +71,22 @@ public class SpoutRegionManager extends AsyncManager {
 	}
 
 	@Override
-	public void runLocalPhysics() throws InterruptedException {
-		parent.runLocalPhysics();
+	public void runPhysics(int sequence) throws InterruptedException {
+		parent.runPhysics(sequence);
 	}
 
-	@Override
-	public int runGlobalPhysics() throws InterruptedException {
-		return parent.runGlobalPhysics();
-	}
-	
 	@Override
 	public long getFirstDynamicUpdateTime() {
 		return parent.getFirstDynamicUpdateTime();
 	}
 
 	@Override
-	public void runLocalDynamicUpdates(long time) throws InterruptedException {
-		parent.runLocalDynamicUpdates(time);
+	public void runDynamicUpdates(long time, int sequence) throws InterruptedException {
+		parent.runDynamicUpdates(time, sequence);
 	}
-
+	
 	@Override
-	public int runGlobalDynamicUpdates() throws InterruptedException {
-		return parent.runGlobalDynamicUpdates();
+	public int getSequence() {
+		return parent.getSequence();
 	}
 }

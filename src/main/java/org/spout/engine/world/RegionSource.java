@@ -38,7 +38,8 @@ import org.spout.api.geo.LoadOption;
 import org.spout.api.geo.cuboid.Region;
 import org.spout.api.scheduler.TaskManager;
 import org.spout.api.scheduler.TickStage;
-import org.spout.api.util.map.concurrent.TSyncInt21TripleObjectHashMap;
+import org.spout.api.util.map.concurrent.TripleIntObjectMap;
+import org.spout.api.util.map.concurrent.TripleIntObjectReferenceArrayMap;
 import org.spout.api.util.thread.DelayedWrite;
 import org.spout.api.util.thread.LiveRead;
 import org.spout.engine.scheduler.SpoutParallelTaskManager;
@@ -46,20 +47,22 @@ import org.spout.engine.scheduler.SpoutScheduler;
 import org.spout.engine.util.thread.snapshotable.SnapshotManager;
 
 public class RegionSource implements Iterable<Region> {
+	private final static int REGION_MAP_BITS = 5;
+
 	private final static AtomicInteger regionsLoaded = new AtomicInteger(0);
 	private final static AtomicInteger warnThreshold = new AtomicInteger(Integer.MAX_VALUE);
 	/**
 	 * A map of loaded regions, mapped to their x and z values.
 	 */
-	private final TSyncInt21TripleObjectHashMap<Region> loadedRegions;
+	private final TripleIntObjectMap<Region> loadedRegions;
 	/**
 	 * World associated with this region source
 	 */
-	private final SpoutWorld world;
+	private final SpoutAbstractWorld world;
 
-	public RegionSource(SpoutWorld world, SnapshotManager snapshotManager) {
+	public RegionSource(SpoutAbstractWorld world, SnapshotManager snapshotManager) {
 		this.world = world;
-		loadedRegions = new TSyncInt21TripleObjectHashMap<Region>();
+		loadedRegions = new TripleIntObjectReferenceArrayMap<Region>(REGION_MAP_BITS);
 	}
 
 	@DelayedWrite
@@ -70,33 +73,37 @@ public class RegionSource implements Iterable<Region> {
 
 		// removeRegion is called during snapshot copy on the Region thread (when the last chunk is removed)
 		// Needs re-syncing to a safe moment
-		((SpoutScheduler)Spout.getEngine().getScheduler()).scheduleCoreTask(new Runnable() {
+		(world.getEngine().getScheduler()).scheduleCoreTask(new Runnable() {
 			@Override
 			public void run() {
 				if (r.isEmpty()) {
-					int x = r.getX();
-					int y = r.getY();
-					int z = r.getZ();
-					boolean success = loadedRegions.remove(x, y, z, r);
-					if (success) {
-						if (!r.getManager().getExecutor().haltExecutor()) {
-							throw new IllegalStateException("Failed to halt the region executor when removing the region");
-						}
-						TaskManager tm = Spout.getEngine().getParallelTaskManager();
-						SpoutParallelTaskManager ptm = (SpoutParallelTaskManager)tm;
-						ptm.unRegisterRegion(r);
+					if (r.attemptClose()) {
+						int x = r.getX();
+						int y = r.getY();
+						int z = r.getZ();
+						boolean success = loadedRegions.remove(x, y, z, r);
+						if (success) {
+							if (!r.getManager().getExecutor().haltExecutor()) {
+								throw new IllegalStateException("Failed to halt the region executor when removing the region");
+							}
+							TaskManager tm = Spout.getEngine().getParallelTaskManager();
+							SpoutParallelTaskManager ptm = (SpoutParallelTaskManager)tm;
+							ptm.unRegisterRegion(r);
 
-						TaskManager tmWorld = world.getParallelTaskManager();
-						SpoutParallelTaskManager ptmWorld = (SpoutParallelTaskManager)tmWorld;
-						ptmWorld.unRegisterRegion(r);
-						
-						if (regionsLoaded.decrementAndGet() < 0) {
-							Spout.getLogger().info("Regions loaded dropped below zero");
-						}
+							TaskManager tmWorld = world.getParallelTaskManager();
+							SpoutParallelTaskManager ptmWorld = (SpoutParallelTaskManager)tmWorld;
+							ptmWorld.unRegisterRegion(r);
 
-						Spout.getEventManager().callDelayedEvent(new RegionUnloadEvent(world, r));
+							if (regionsLoaded.decrementAndGet() < 0) {
+								Spout.getLogger().info("Regions loaded dropped below zero");
+							}
+
+							Spout.getEventManager().callDelayedEvent(new RegionUnloadEvent(world, r));
+						} else {
+							Spout.getLogger().info("Tried to remove region " + r + " but region removal failed");
+						}
 					} else {
-						Spout.getLogger().info("Tried to remove region " + r + " but region removal failed");
+						Spout.getLogger().info("Unable to close region file, streams must be open");
 					}
 				} else {
 					Spout.getLogger().info("Region was not empty when attempting to remove, active chunks returns " + r.getNumLoadedChunks());

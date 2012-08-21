@@ -26,13 +26,12 @@
  */
 package org.spout.engine.command;
 
-import java.util.ArrayList;
 import java.util.Arrays;
 import java.util.Iterator;
-import java.util.List;
 import java.util.Map;
 import java.util.Map.Entry;
 
+import org.spout.api.chat.ChatArguments;
 import org.spout.api.chat.style.ChatStyle;
 import org.spout.api.Spout;
 import org.spout.api.command.CommandContext;
@@ -41,28 +40,37 @@ import org.spout.api.command.annotated.Command;
 import org.spout.api.command.annotated.CommandPermissions;
 import org.spout.api.exception.CommandException;
 import org.spout.api.player.Player;
+import org.spout.api.plugin.Platform;
 import org.spout.api.plugin.Plugin;
 
-import org.spout.engine.SpoutServer;
+import org.spout.engine.SpoutEngine;
 
-/**
- * Commands related to server administration
- */
 public class AdministrationCommands {
-	private final SpoutServer server;
+	private final SpoutEngine engine;
 
-	public AdministrationCommands(SpoutServer server) {
-		this.server = server;
+	public AdministrationCommands(SpoutEngine engine) {
+		this.engine = engine;
 	}
 
 	@Command(aliases = "stop", usage = "[message]", desc = "Stop the server!", max = -1)
 	@CommandPermissions("spout.command.stop")
 	public void stop(CommandContext args, CommandSource source) {
-		String message = "Server shutting down";
-		if (args.length() > 0) {
-			message = args.getJoinedString(0);
+		String message = "Engine halting";
+		switch (Spout.getPlatform()) {
+			case CLIENT:
+				message = "Client halting";
+				break;
+			case PROXY:
+				message = "Proxy halting";
+				break;
+			case SERVER:
+				message = "Server halting";
+				break;
 		}
-		server.stop(message);
+		if (args.length() > 0) {
+			message = args.getJoinedString(0).getPlainString();
+		}
+		engine.stop(message);
 	}
 
 	@Command(desc = "Writes the stack trace of all active threads to the logs", max = -1, aliases = {""})
@@ -70,39 +78,53 @@ public class AdministrationCommands {
 	public void dumpstack(CommandContext args, CommandSource source) {
 		Map<Thread, StackTraceElement[]> dump = Thread.getAllStackTraces();
 		Iterator<Entry<Thread, StackTraceElement[]>> i = dump.entrySet().iterator();
-		server.getLogger().info("[--------------Thread Stack Dump--------------]");
+		engine.getLogger().info("[--------------Thread Stack Dump--------------]");
 		while (i.hasNext()) {
 			Entry<Thread, StackTraceElement[]> e = i.next();
-			server.getLogger().info("Thread: " + e.getKey().getName());
+			engine.getLogger().info("Thread: " + e.getKey().getName());
 			for (StackTraceElement element : e.getValue()) {
-				server.getLogger().info("    " + element.toString());
+				engine.getLogger().info("    " + element.toString());
 			}
-			server.getLogger().info("");
+			engine.getLogger().info("");
 		}
-		server.getLogger().info("[---------------End Stack Dump---------------]");
+		engine.getLogger().info("[---------------End Stack Dump---------------]");
 	}
 
 	@Command(aliases = "kick", usage = "<player> [message]", desc = "Kick a player", min = 1, max = -1)
 	@CommandPermissions("spout.command.kick")
-	public void kick(CommandContext args, CommandSource source) {
+	public void kick(CommandContext args, CommandSource source) throws CommandException {
+		if (Spout.getPlatform() != Platform.SERVER) {
+			source.sendMessage(ChatStyle.RED, "Kick is available only in server-mode.");
+			return;
+		}
 		String playerName = args.getString(0);
-		String message = "You have been kicked from the server.";
+		ChatArguments message;
 		if (args.length() >= 2) {
 			message = args.getJoinedString(1);
+		} else {
+			message = new ChatArguments("You have been kicked from the server.");
 		}
 
 		Player player = Spout.getEngine().getPlayer(playerName, true);
+		if (player == null) {
+			throw new CommandException("Unknown player: " + player);
+		}
+
 		if (player.isOnline()) {
 			player.kick(message);
-			source.sendMessage(ChatStyle.BRIGHT_GREEN, "Kicked player '", player.getName(), (!message.isEmpty() ? "' for reason '" + message + "'" : "'"));
+			ChatArguments retMsg = new ChatArguments(ChatStyle.BRIGHT_GREEN, "Kicked player '", player.getName(), "'");
+			if (!message.getPlainString().isEmpty()) {
+				retMsg.append(" for reason '").append(message).append("'");
+			}
+			source.sendMessage(retMsg);
 		}
 	}
 
-	@Command(aliases = "reload", usage = "[plugin]", desc = "Reload server and/or plugins", max = 1)
+	@Command(aliases = "reload", usage = "[plugin]", desc = "Reload engine and/or plugins", max = 1)
 	@CommandPermissions("spout.command.reload")
 	public void reload(CommandContext args, CommandSource source) throws CommandException {
 		if (args.length() == 0) {
-			source.sendMessage(ChatStyle.BRIGHT_GREEN, "Reloading server...");
+			source.sendMessage(ChatStyle.BRIGHT_GREEN, "Reloading engine...");
 
 			for (Plugin plugin : Spout.getEngine().getPluginManager().getPlugins()) {
 				if (plugin.getDescription().allowsReload()) {
@@ -125,25 +147,24 @@ public class AdministrationCommands {
 			source.sendMessage(ChatStyle.BRIGHT_GREEN, "Reloaded '", pluginName, "'.");
 		}
 	}
-	@SuppressWarnings("unchecked")
-	@Command(aliases = {"plugins", "pl"}, desc = "List all plugins on the server")
+
+	@Command(aliases = {"plugins", "pl"}, desc = "List all plugins on the engine")
 	@CommandPermissions("spout.command.plugins")
 	public void plugins(CommandContext args, CommandSource source) {
 		Plugin[] pluginList = Spout.getEngine().getPluginManager().getPlugins();
-		List<Object> pluginListString = new ArrayList<Object>(pluginList.length * 3 + 3);
-		pluginListString.addAll(Arrays.<Object>asList("Plugins (", pluginList.length, "): "));
+		ChatArguments pluginListString = new ChatArguments();
+		pluginListString.append(Arrays.<Object>asList("Plugins (", pluginList.length, "): "));
 
 		for (int i = 0; i < pluginList.length; i++) {
 			if (pluginList[i].getName().equalsIgnoreCase("Spout")) {
 				continue;
 			}
 
-			pluginListString.add(pluginList[i].isEnabled() ? ChatStyle.BRIGHT_GREEN : ChatStyle.RED);
-			pluginListString.add(pluginList[i].getName());
+			pluginListString.append(pluginList[i].isEnabled() ? ChatStyle.BRIGHT_GREEN : ChatStyle.RED)
+			.append(pluginList[i].getName());
 
 			if (i != pluginList.length - 1) {
-				pluginListString.add(ChatStyle.RESET);
-				pluginListString.add(", ");
+				pluginListString.append(ChatStyle.RESET).append(", ");
 			}
 		}
 		source.sendMessage(pluginListString);
@@ -153,16 +174,14 @@ public class AdministrationCommands {
 	@CommandPermissions("spout.command.players")
 	public void onPlayersCommand(CommandContext args, CommandSource source) {
 		Player[] players = Spout.getEngine().getOnlinePlayers();
-		List<Object> onlineMsg = new ArrayList<Object>(Arrays.asList("Online (", (players.length <= 0 ? ChatStyle.RED : ChatStyle.BRIGHT_GREEN), players.length, ChatStyle.RESET, "): "));
+		ChatArguments onlineMsg = new ChatArguments(Arrays.asList("Online (", (players.length <= 0 ? ChatStyle.RED : ChatStyle.BRIGHT_GREEN), players.length, ChatStyle.RESET, "): "));
 		for (int i = 0; i < players.length; i ++) {
 			if (!players[i].isOnline()) {
 				continue;
 			}
-			onlineMsg.add(ChatStyle.BLUE);
-			onlineMsg.add(players[i].getName());
-			onlineMsg.add(ChatStyle.RESET);
+			onlineMsg.append(ChatStyle.BLUE).append(players[i].getName()).append(ChatStyle.RESET);
 			if (i < players.length - 1) {
-				onlineMsg.add(", ");
+				onlineMsg.append(", ");
 			}
 		}
 		source.sendMessage(onlineMsg);

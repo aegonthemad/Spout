@@ -24,22 +24,63 @@
  * License and see <http://www.spout.org/SpoutDevLicenseV1.txt> for the full license,
  * including the MIT license.
  */
-package org.spout.engine.util;
+package org.spout.engine.chat.console;
 
-import com.beust.jcommander.IStringConverter;
+import java.text.DateFormat;
+import java.util.ArrayList;
+import java.util.Arrays;
+import java.util.Collections;
+import java.util.List;
+
+import org.spout.api.chat.ChatArguments;
 
 /**
- * @author zml2008
+ * A wrapper console that allows accessing multiple consoles at once
  */
-public class EnumConverter<T extends Enum<T>> implements IStringConverter<T> {
-	private final Class<T> enumClass;
+public class MultiConsole implements Console {
+	private final List<Console> consoles = new ArrayList<Console>();
 
-	public EnumConverter(Class<T> enumClass) {
-		this.enumClass = enumClass;
+	public MultiConsole() {
+
 	}
 
-	@Override
-	public T convert(String s) {
-		return Enum.valueOf(enumClass, s.toUpperCase());
+	public MultiConsole(Console... consoles) {
+		this.consoles.addAll(Arrays.asList(consoles));
+	}
+
+	public List<Console> getConsoles() {
+		return Collections.unmodifiableList(consoles);
+	}
+
+	public boolean removeConsole(Console console) {
+		return consoles.remove(console);
+	}
+
+	public void addConsole(Console console) {
+		consoles.add(console);
+	}
+
+	public void init() {
+		for (Console console : consoles) {
+			console.init();
+		}
+	}
+
+	public void close() {
+		for (Console console : consoles) {
+			console.close();
+		}
+	}
+
+	public void setDateFormat(DateFormat format) {
+		for (Console console : consoles) {
+			console.setDateFormat(format);
+		}
+	}
+
+	public void addMessage(ChatArguments message) {
+		for (Console console : consoles) {
+			console.addMessage(message);
+		}
 	}
 }

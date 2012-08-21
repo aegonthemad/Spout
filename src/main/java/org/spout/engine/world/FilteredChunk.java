@@ -113,22 +113,17 @@ public class FilteredChunk extends SpoutChunk{
 	public boolean isAboveGround() {
 		return this.getY() >= 4;
 	}
-	
-	@Override
-	public boolean setBlockData(int x, int y, int z, short data, Source source) {
-		if (uniform.get()) {
-			initialize();
-		}
-		chunkModified.set(true);
-		return super.setBlockData(x, y, z, data, source);
-	}
 
 	@Override
 	public boolean setBlockMaterial(int x, int y, int z, BlockMaterial material, short data, Source source) {
 		if (uniform.get()) {
 			initialize();
 		}
-		return super.setBlockMaterial(x, y, z, material, data, source);
+		boolean changed = super.setBlockMaterial(x, y, z, material, data, source);
+		if (changed) {
+			chunkModified.set(true);
+		}
+		return changed;
 	}
 
 	@Override
@@ -176,6 +171,15 @@ public class FilteredChunk extends SpoutChunk{
 	}
 
 	@Override
+	protected int addBlockDataFieldRaw(int bx, int by, int bz, int bits, int value, Source source) {
+		if (uniform.get()) {
+			initialize();
+		}
+		chunkModified.set(true);
+		return super.addBlockDataFieldRaw(bx, by, bz, bits, value, source);
+	}
+
+	@Override
 	public boolean compareAndSetData(int x, int y, int z, int expect, short data, Source source) {
 		if (uniform.get()) {
 			Material m = material.get();
@@ -194,8 +198,11 @@ public class FilteredChunk extends SpoutChunk{
 		if (uniform.get()) {
 			return false;
 		}
-		chunkModified.set(true);
-		return super.setBlockLight(x, y, z, light, source);
+		boolean changed = super.setBlockLight(x, y, z, light, source);
+		if (changed) {
+			chunkModified.set(true);
+		}
+		return changed;
 	}
 
 	@Override
@@ -203,8 +210,11 @@ public class FilteredChunk extends SpoutChunk{
 		if (uniform.get()) {
 			return false;
 		}
-		chunkModified.set(true);
-		return super.setBlockSkyLight(x, y, z, light, source);
+		boolean changed = super.setBlockSkyLight(x, y, z, light, source);
+		if (changed) {
+			chunkModified.set(true);
+		}
+		return changed;
 	}
 
 	@Override
@@ -243,7 +253,7 @@ public class FilteredChunk extends SpoutChunk{
 		if (this.chunkModified.compareAndSet(true, false)) {
 			super.syncSave();
 		} else {
-			//System.out.println("Cancelling save of " + toString() + " no modifications");
+			super.saveComplete();
 		}
 	}
 

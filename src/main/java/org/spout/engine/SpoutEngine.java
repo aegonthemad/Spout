@@ -42,8 +42,6 @@ import java.util.Set;
 import java.util.UUID;
 import java.util.concurrent.ConcurrentHashMap;
 import java.util.concurrent.ConcurrentMap;
-import java.util.concurrent.ExecutorService;
-import java.util.concurrent.Executors;
 import java.util.concurrent.atomic.AtomicBoolean;
 import java.util.logging.Level;
 import java.util.logging.Logger;
@@ -51,29 +49,24 @@ import java.util.logging.Logger;
 import org.apache.commons.io.filefilter.DirectoryFileFilter;
 import org.jboss.netty.channel.group.ChannelGroup;
 import org.jboss.netty.channel.group.DefaultChannelGroup;
-import org.spout.api.chat.style.ChatStyle;
 import org.spout.api.Engine;
 import org.spout.api.FileSystem;
 import org.spout.api.Spout;
-import org.spout.api.command.Command;
+import org.spout.api.chat.ChatArguments;
 import org.spout.api.command.CommandRegistrationsFactory;
 import org.spout.api.command.CommandSource;
 import org.spout.api.command.RootCommand;
 import org.spout.api.command.annotated.AnnotatedCommandRegistrationFactory;
-import org.spout.api.command.annotated.SimpleAnnotatedCommandExecutorFactory;
 import org.spout.api.command.annotated.SimpleInjector;
 import org.spout.api.entity.Entity;
 import org.spout.api.event.EventManager;
 import org.spout.api.event.SimpleEventManager;
-import org.spout.api.event.server.PreCommandEvent;
+import org.spout.api.event.server.ServerStopEvent;
 import org.spout.api.event.server.permissions.PermissionGetAllWithNodeEvent;
 import org.spout.api.event.world.WorldLoadEvent;
 import org.spout.api.event.world.WorldUnloadEvent;
-import org.spout.api.exception.CommandException;
-import org.spout.api.exception.CommandUsageException;
 import org.spout.api.exception.ConfigurationException;
 import org.spout.api.exception.SpoutRuntimeException;
-import org.spout.api.exception.WrappedCommandException;
 import org.spout.api.generator.EmptyWorldGenerator;
 import org.spout.api.generator.WorldGenerator;
 import org.spout.api.generator.biome.BiomeRegistry;
@@ -90,23 +83,27 @@ import org.spout.api.player.Player;
 import org.spout.api.plugin.CommonPluginLoader;
 import org.spout.api.plugin.CommonPluginManager;
 import org.spout.api.plugin.CommonServiceManager;
-import org.spout.api.plugin.Platform;
 import org.spout.api.plugin.Plugin;
 import org.spout.api.plugin.PluginManager;
 import org.spout.api.plugin.ServiceManager;
 import org.spout.api.plugin.security.CommonSecurityManager;
+import org.spout.api.protocol.Protocol;
 import org.spout.api.protocol.SessionRegistry;
-import org.spout.api.protocol.bootstrap.BootstrapProtocol;
 import org.spout.api.scheduler.TaskManager;
 import org.spout.api.scheduler.TaskPriority;
 import org.spout.api.util.Profiler;
 import org.spout.api.util.StringMap;
 import org.spout.api.util.StringUtil;
+import org.spout.engine.chat.console.Console;
+import org.spout.engine.chat.console.ConsoleManager;
+import org.spout.engine.chat.console.FileConsole;
+import org.spout.engine.chat.console.JLineConsole;
+import org.spout.engine.chat.console.MultiConsole;
 import org.spout.engine.command.AdministrationCommands;
+import org.spout.engine.command.ConnectionCommands;
 import org.spout.engine.command.MessagingCommands;
 import org.spout.engine.command.TestCommands;
 import org.spout.engine.entity.EntityManager;
-import org.spout.engine.entity.SpoutEntity;
 import org.spout.engine.filesystem.SharedFileSystem;
 import org.spout.engine.filesystem.WorldFiles;
 import org.spout.engine.player.SpoutPlayer;
@@ -114,7 +111,6 @@ import org.spout.engine.protocol.SpoutSession;
 import org.spout.engine.protocol.SpoutSessionRegistry;
 import org.spout.engine.scheduler.SpoutParallelTaskManager;
 import org.spout.engine.scheduler.SpoutScheduler;
-import org.spout.engine.util.ConsoleManager;
 import org.spout.engine.util.DeadlockMonitor;
 import org.spout.engine.util.TicklockMonitor;
 import org.spout.engine.util.thread.AsyncManager;
@@ -122,16 +118,14 @@ import org.spout.engine.util.thread.ThreadAsyncExecutor;
 import org.spout.engine.util.thread.snapshotable.SnapshotManager;
 import org.spout.engine.util.thread.snapshotable.SnapshotableLinkedHashMap;
 import org.spout.engine.util.thread.snapshotable.SnapshotableReference;
-import org.spout.engine.util.thread.threadfactory.NamedThreadFactory;
+import org.spout.engine.world.SpoutAbstractWorld;
 import org.spout.engine.world.SpoutRegion;
 import org.spout.engine.world.SpoutWorld;
 import org.spout.engine.world.WorldSavingThread;
 
-import com.beust.jcommander.Parameter;
-
-public class SpoutEngine extends AsyncManager implements Engine {
-	public static final Logger logger = Logger.getLogger("Spout");
-
+public abstract class SpoutEngine extends AsyncManager implements Engine {
+	private static final SpoutPlayer[] EMPTY_PLAYER_ARRAY = new SpoutPlayer[0];
+	private static final Logger logger = Logger.getLogger("Spout");
 	private final String name = "Spout Engine";
 	private final File pluginDirectory = SharedFileSystem.PLUGIN_DIRECTORY;
 	private final File configDirectory = SharedFileSystem.CONFIG_DIRECTORY;
@@ -149,36 +143,25 @@ public class SpoutEngine extends AsyncManager implements Engine {
 	protected final SnapshotableLinkedHashMap<String, SpoutPlayer> onlinePlayers = new SnapshotableLinkedHashMap<String, SpoutPlayer>(snapshotManager);
 	private final RootCommand rootCommand = new RootCommand(this);
 	private final WorldGenerator defaultGenerator = new EmptyWorldGenerator();
-
 	private volatile int maxPlayers = 20;
-	private volatile String[] allAddresses;
-
-	//The network executor service - Netty dispatches events to this thread
-	protected final ExecutorService executor = Executors.newCachedThreadPool(new NamedThreadFactory("SpoutEngine"));
 	protected final SpoutSessionRegistry sessions = new SpoutSessionRegistry();
 	protected final SpoutScheduler scheduler = new SpoutScheduler(this);
 	protected final SpoutParallelTaskManager parallelTaskManager = new SpoutParallelTaskManager(this);
-	protected final ConcurrentMap<SocketAddress, BootstrapProtocol> bootstrapProtocols = new ConcurrentHashMap<SocketAddress, BootstrapProtocol>();
+	protected final ConcurrentMap<SocketAddress, Protocol> boundProtocols = new ConcurrentHashMap<SocketAddress, Protocol>();
 	protected final ChannelGroup group = new DefaultChannelGroup();
-
 	private final AtomicBoolean setupComplete = new AtomicBoolean(false);
 	private final MemoryLeakThread leakThread = new MemoryLeakThread();
-
 	protected SpoutConfiguration config = new SpoutConfiguration();
 	private File worldFolder = new File(".");
 	private SnapshotableLinkedHashMap<String, SpoutWorld> loadedWorlds = new SnapshotableLinkedHashMap<String, SpoutWorld>(snapshotManager);
 	private SnapshotableReference<World> defaultWorld = new SnapshotableReference<World>(snapshotManager, null);
-	private SpoutPlayer[] emptyPlayerArray = new SpoutPlayer[0];
 	private String logFile;
 	private StringMap engineItemMap = null;
 	private StringMap engineBiomeMap = null;
-
 	private ConcurrentHashMap<String, String> cvars = new ConcurrentHashMap<String, String>();
-
 	protected FileSystem filesystem;
-
-	@Parameter(names = {"-debug", "-d", "--debug", "--d" }, description="Debug Mode")
-	private boolean debugMode = false;
+	private Console console;
+	private SpoutApplication arguments;
 
 	public SpoutEngine() {
 		super(1, new ThreadAsyncExecutor("Engine bootstrap thread"));
@@ -186,47 +169,57 @@ public class SpoutEngine extends AsyncManager implements Engine {
 		consoleManager = new ConsoleManager(this);
 	}
 
-	public void init(String[] args) {
-
-		registerWithScheduler(scheduler);
-		if (!getExecutor().startExecutor()) {
-			throw new IllegalStateException("SpoutEngine's executor was already started");
-		}
-		DefaultPermissions.addDefaultPermission(STANDARD_BROADCAST_PERMISSION);
-		if (Spout.getEngine().debugMode()) {
-			new TicklockMonitor().start();
-			new DeadlockMonitor().start();
-		}
-	}
-
-	public void start() {
-		throw new IllegalStateException("The start method should not be called for the engine directly");
-	}
-
-	public void start(boolean checkWorlds) {
-		if (debugMode()) {
-			getLogger().warning("Spout has been started in Debug Mode!  This mode is for developers only");
-			leakThread.start();
-			scheduler.scheduleSyncRepeatingTask(this, new ProfileTask(), 60 * 1000, 60 * 1000, TaskPriority.NORMAL);
-		}
-		
-		scheduler.scheduleSyncRepeatingTask(this, new SessionTask(sessions), 50, 50, TaskPriority.CRITICAL);
-
-		CommandRegistrationsFactory<Class<?>> commandRegFactory = new AnnotatedCommandRegistrationFactory(new SimpleInjector(this), new SimpleAnnotatedCommandExecutorFactory());
-
-		// Register commands
-		getRootCommand().addSubCommands(this, AdministrationCommands.class, commandRegFactory);
-		getRootCommand().addSubCommands(this, MessagingCommands.class, commandRegFactory);
-		if (debugMode) {
-			getRootCommand().addSubCommands(this, TestCommands.class, commandRegFactory);
-		}
-
+	public void init(SpoutApplication args) {
+		this.arguments = args;
 		try {
 			config.load();
 		} catch (ConfigurationException e) {
 			getLogger().log(Level.SEVERE, "Error loading config: " + e.getMessage(), e);
 		}
-		consoleManager.setupConsole(SpoutConfiguration.CONSOLE_TYPE.getString());
+
+		console = new MultiConsole(new FileConsole(this), new JLineConsole(this));
+		consoleManager.setupConsole(console);
+
+		registerWithScheduler(scheduler);
+
+		if (!getExecutor().startExecutor()) {
+			throw new IllegalStateException("SpoutEngine's executor was already started");
+		}
+
+		DefaultPermissions.addDefaultPermission(STANDARD_BROADCAST_PERMISSION);
+
+		if (debugMode()) {
+			new TicklockMonitor().start();
+			new DeadlockMonitor().start();
+		}
+	}
+
+	public abstract void start();
+
+	public void start(boolean checkWorlds) {
+		getLogger().info("Spout is starting in " + getPlatform().name().toLowerCase() + "-only mode.");
+		getLogger().info("Current version is " + Spout.getEngine().getVersion() + " (Implementing SpoutAPI " + Spout.getAPIVersion() + ").");
+		getLogger().info("This software is currently in alpha status so components may");
+		getLogger().info("have bugs or not work at all. Please report any issues to");
+		getLogger().info("http://issues.spout.org");
+
+		if (debugMode()) {
+			getLogger().warning("Debug Mode has been toggled on!  This mode is intended for developers only");
+			leakThread.start();
+			scheduler.scheduleSyncRepeatingTask(this, new ProfileTask(), 60 * 1000, 60 * 1000, TaskPriority.NORMAL);
+		}
+
+		scheduler.scheduleSyncRepeatingTask(this, new SessionTask(sessions), 50, 50, TaskPriority.CRITICAL);
+
+		final CommandRegistrationsFactory<Class<?>> commandRegFactory = new AnnotatedCommandRegistrationFactory(new SimpleInjector(this));
+
+		// Register commands
+		getRootCommand().addSubCommands(this, AdministrationCommands.class, commandRegFactory);
+		getRootCommand().addSubCommands(this, MessagingCommands.class, commandRegFactory);
+		getRootCommand().addSubCommands(this, ConnectionCommands.class, commandRegFactory);
+		if (arguments.debug) {
+			getRootCommand().addSubCommands(this, TestCommands.class, commandRegFactory);
+		}
 
 		//Setup the Material Registry
 		engineItemMap = MaterialRegistry.setupRegistry();
@@ -235,6 +228,7 @@ public class SpoutEngine extends AsyncManager implements Engine {
 
 		// Start loading plugins
 		loadPlugins();
+		postPluginLoad();
 		enablePlugins();
 
 		if (checkWorlds) {
@@ -253,14 +247,15 @@ public class SpoutEngine extends AsyncManager implements Engine {
 			getDefaultWorld();
 		}
 
-		if (bootstrapProtocols.size() == 0) {
-			getLogger().warning("No bootstrap protocols registered! Clients will not be able to connect to the server.");
-		}
-
 		scheduler.startMainThread();
 		WorldSavingThread.startThread();
 		setupComplete.set(true);
 	}
+
+	/**
+	 * This method is called after {@link #loadPlugins()} but before {@link #enablePlugins()}
+	 */
+	protected void postPluginLoad() {}
 
 	public void loadPlugins() {
 		pluginManager.registerPluginLoader(CommonPluginLoader.class);
@@ -281,6 +276,10 @@ public class SpoutEngine extends AsyncManager implements Engine {
 				ex.printStackTrace();
 			}
 		}
+	}
+
+	public SpoutApplication getArguments() {
+		return arguments;
 	}
 
 	private void enablePlugins() {
@@ -318,7 +317,7 @@ public class SpoutEngine extends AsyncManager implements Engine {
 				onlinePlayers.add(player);
 			}
 		}
-		return onlinePlayers.toArray(emptyPlayerArray);
+		return onlinePlayers.toArray(new SpoutPlayer[onlinePlayers.size()]);
 	}
 
 	@Override
@@ -327,29 +326,20 @@ public class SpoutEngine extends AsyncManager implements Engine {
 	}
 
 	@Override
-	public String getAddress() {
-		return SpoutConfiguration.ADDRESS.getString();
-	}
-
-	@Override
-	public String[] getAllAddresses() {
-		return allAddresses;
-	}
-
-	@Override
 	public void broadcastMessage(Object... message) {
 		broadcastMessage(STANDARD_BROADCAST_PERMISSION, message);
 	}
 
 	public void broadcastMessage(String msg) {
-		broadcastMessage(new Object[] {msg});
+		broadcastMessage(new Object[]{msg});
 	}
 
 	@Override
 	public void broadcastMessage(String permission, Object... message) {
+		ChatArguments args = new ChatArguments(message);
 		for (PermissionsSubject player : getAllWithNode(permission)) {
 			if (player instanceof CommandSource) {
-				((CommandSource) player).sendMessage(message);
+				((CommandSource) player).sendMessage(args);
 			}
 		}
 	}
@@ -367,31 +357,6 @@ public class SpoutEngine extends AsyncManager implements Engine {
 	@Override
 	public Logger getLogger() {
 		return logger;
-	}
-
-	@Override
-	public void processCommand(CommandSource source, String commandLine) {
-		try {
-			PreCommandEvent event = getEventManager().callEvent(new PreCommandEvent(source, commandLine));
-			if (event.isCancelled()) {
-				return;
-			}
-			commandLine = event.getMessage();
-			getRootCommand().execute(source, commandLine.split(" "), -1, false);
-		} catch (WrappedCommandException e) {
-			if (e.getCause() instanceof NumberFormatException) {
-				source.sendMessage(ChatStyle.RED, "Number expected; string given!");
-			} else {
-				source.sendMessage(ChatStyle.RED, "Internal error executing command!");
-				source.sendMessage(ChatStyle.RED, "Error: ", e.getMessage(), "; See console for details.");
-				e.printStackTrace();
-			}
-		} catch (CommandUsageException e) {
-			source.sendMessage(ChatStyle.RED, e.getMessage());
-			source.sendMessage(ChatStyle.RED, e.getUsage());
-		} catch (CommandException e) {
-			source.sendMessage(ChatStyle.RED, e.getMessage());
-		}
 	}
 
 	@Override
@@ -446,14 +411,14 @@ public class SpoutEngine extends AsyncManager implements Engine {
 	}
 
 	@Override
-	public World getWorld(String name) {
+	public SpoutAbstractWorld getWorld(String name) {
 		return getWorld(name, true);
 	}
 
 	@Override
-	public World getWorld(String name, boolean exact) {
+	public SpoutAbstractWorld getWorld(String name, boolean exact) {
 		if (exact) {
-			World world = loadedWorlds.get().get(name);
+			SpoutWorld world = loadedWorlds.get().get(name);
 			if (world != null) {
 				return world;
 			}
@@ -497,7 +462,7 @@ public class SpoutEngine extends AsyncManager implements Engine {
 		}
 
 		SpoutWorld world = WorldFiles.loadWorldFromData(name, generator, engineItemMap);
-		if(world == null) {
+		if (world == null) {
 			Spout.getLogger().info("Generating new world named [" + name + "]");
 
 			File itemMapFile = new File(new File(SharedFileSystem.WORLDS_DIRECTORY, name), "materials.dat");
@@ -526,28 +491,61 @@ public class SpoutEngine extends AsyncManager implements Engine {
 	}
 
 	@Override
-	public void stop() {
-		stop("Spout shutting down");
+	public boolean stop() {
+		return stop("Spout shutting down");
 	}
 
+	private final AtomicBoolean stopping = new AtomicBoolean();
 	@Override
-	public void stop(String message) {
-		setupComplete.set(false);
-		for (SpoutPlayer player : getOnlinePlayers()) {
-			player.kick(message);
-		}
-
-		for (SpoutWorld world : this.getLiveWorlds()) {
-			world.unload(true, true);
+	public boolean stop(final String message) {
+		return stop(message, true);
+	}
+	
+	/**
+	 * Used to allow subclasses submit final tasks before stopping the scheduler
+	 * 
+	 * @param message
+	 * @param stopScheduler
+	 * @return
+	 */
+	protected boolean stop(final String message, boolean stopScheduler) {
+		final SpoutEngine engine = this;
+		
+		if (!stopping.compareAndSet(false, true)) {
+			return false;
 		}
 
 		getPluginManager().clearPlugins();
-		consoleManager.stop();
-		scheduler.stop(5000);
-		group.close();
-		bootstrapProtocols.clear();
-		executor.shutdown();
-		WorldSavingThread.finish();
+
+		Runnable lastTickTask = new Runnable() {
+			public void run() {
+				ServerStopEvent stopEvent = new ServerStopEvent(message);
+				getEventManager().callEvent(stopEvent);
+
+				setupComplete.set(false);
+				for (SpoutPlayer player : getOnlinePlayers()) {
+					player.kick(stopEvent.getMessage());
+				}
+
+				for (SpoutWorld world : engine.getLiveWorlds()) {
+					world.unload(true);
+				}
+			}
+		};
+
+
+		Runnable finalTask = new Runnable() {
+			@Override
+			public void run() {
+				group.close();
+				WorldSavingThread.finish();
+				WorldSavingThread.staticJoin();
+			}
+		};
+		scheduler.submitLastTickTask(lastTickTask);
+		scheduler.submitFinalTask(finalTask);
+		scheduler.stop(1);
+		return true;
 	}
 
 	@Override
@@ -572,18 +570,13 @@ public class SpoutEngine extends AsyncManager implements Engine {
 	}
 
 	@Override
-	public Command getRootCommand() {
+	public RootCommand getRootCommand() {
 		return rootCommand;
 	}
 
 	@Override
 	public EventManager getEventManager() {
 		return eventManager;
-	}
-
-	@Override
-	public Platform getPlatform() {
-		throw new IllegalStateException("Platform method should not be called by the raw Engine class");
 	}
 
 	@Override
@@ -612,13 +605,14 @@ public class SpoutEngine extends AsyncManager implements Engine {
 	}
 
 	@Override
-	public BootstrapProtocol getBootstrapProtocol(SocketAddress socketAddress) {
-		BootstrapProtocol proto = bootstrapProtocols.get(socketAddress);
+	public Protocol getProtocol(SocketAddress socketAddress) {
+		Protocol proto = boundProtocols.get(socketAddress);
 		if (proto == null) {
-			for (Map.Entry<SocketAddress, BootstrapProtocol> entry : bootstrapProtocols.entrySet()) {
+			for (Map.Entry<SocketAddress, Protocol> entry : boundProtocols.entrySet()) {
 				if (entry.getKey() instanceof InetSocketAddress && socketAddress instanceof InetSocketAddress) {
 					InetSocketAddress key = (InetSocketAddress) entry.getKey(), given = (InetSocketAddress) socketAddress;
-					if (key.getPort() == given.getPort() && (key.getAddress().getHostAddress().equals("0.0.0.0") && given.getAddress() instanceof Inet4Address || given.getAddress() instanceof Inet6Address && key.getAddress().getHostAddress().equals("::"))) { // TODO: Make sure IPV6 works
+					if (key.getPort() == given.getPort() && ((given.getAddress() instanceof Inet4Address && key.getAddress().getHostAddress().equals("0.0.0.0"))
+							|| (given.getAddress() instanceof Inet6Address && key.getAddress().getHostAddress().equals("::")))) { // TODO: Make sure IPV6 works
 						proto = entry.getValue();
 						break;
 					}
@@ -644,7 +638,7 @@ public class SpoutEngine extends AsyncManager implements Engine {
 
 	@Override
 	public boolean debugMode() {
-		return debugMode;
+		return arguments.debug;
 	}
 
 	@Override
@@ -686,7 +680,7 @@ public class SpoutEngine extends AsyncManager implements Engine {
 	@Override
 	public void haltRun() throws InterruptedException {
 		logger.info("Server halting");
-		consoleManager.closeFiles();
+		console.close();
 	}
 
 	@Override
@@ -722,12 +716,6 @@ public class SpoutEngine extends AsyncManager implements Engine {
 	}
 
 	@Override
-	public String[] getAllCommands() {
-		Set<String> result = getRootCommand().getChildNames();
-		return result.toArray(new String[result.size()]);
-	}
-
-	@Override
 	public boolean unloadWorld(String name, boolean save) {
 		return unloadWorld(loadedWorlds.getLive().get(name), save);
 	}
@@ -746,7 +734,7 @@ public class SpoutEngine extends AsyncManager implements Engine {
 					throw new IllegalStateException("Executor was already halted when halting was attempted");
 				}
 				getEventManager().callDelayedEvent(new WorldUnloadEvent(world));
-				w.unload(save, false);
+				w.unload(save);
 			}
 			//Note: Worlds should not allow being saved twice and/or throw exceptions if accessed after unloading
 			//      Also, should blank out as much internal world data as possible, in case plugins retain references to unloaded worlds
@@ -779,31 +767,28 @@ public class SpoutEngine extends AsyncManager implements Engine {
 	}
 
 	// Players should use weak map?
-	public Player addPlayer(String playerName, SpoutSession session, int viewDistance) {
-		SpoutPlayer player = null;
-
-		// The new player needs a corresponding entity
-		SpoutEntity newEntity = new SpoutEntity(this, getDefaultWorld().getSpawnPoint(), null, viewDistance);
+	public Player addPlayer(String playerName, SpoutSession<?> session, int viewDistance) {
+		SpoutPlayer player;
 
 		while (true) {
 			player = onlinePlayers.getLive().get(playerName);
 
 			if (player != null) {
-				if (!player.connect(session, newEntity)) {
+				if (!player.connect(session, getDefaultWorld().getSpawnPoint())) {
 					return null;
 				}
-
 				break;
 			}
 
-			player = new SpoutPlayer(playerName, newEntity, session);
+			player = new SpoutPlayer(playerName, getDefaultWorld().getSpawnPoint(), session, this, viewDistance);
 			if (onlinePlayers.putIfAbsent(playerName, player) == null) {
 				break;
 			}
 		}
 
-		World world = newEntity.getWorld();
-		world.spawnEntity(newEntity);
+		World world = player.getWorld();
+		player.getSession().getProtocol().setPlayerController(player);
+		world.spawnEntity(player);
 		session.setPlayer(player);
 		((SpoutWorld) world).addPlayer(player);
 		return player;
@@ -819,7 +804,6 @@ public class SpoutEngine extends AsyncManager implements Engine {
 
 	/**
 	 * Gets the item map used across all worlds on the engine
-	 *
 	 * @return engine map
 	 */
 	public StringMap getEngineItemMap() {
@@ -828,7 +812,6 @@ public class SpoutEngine extends AsyncManager implements Engine {
 
 	/**
 	 * Gets the biome map used accorss all worlds on the engine
-	 *
 	 * @return biome map
 	 */
 	public StringMap getBiomeMap() {
@@ -848,15 +831,14 @@ public class SpoutEngine extends AsyncManager implements Engine {
 		return leakThread;
 	}
 
+	public Console getConsole() {
+		return console;
+	}
+
 	// The engine doesn't do any of these
 
 	@Override
-	public void runLocalPhysics() throws InterruptedException {
-	}
-
-	@Override
-	public int runGlobalPhysics() throws InterruptedException {
-		return 0;
+	public void runPhysics(int sequence) throws InterruptedException {
 	}
 
 	@Override
@@ -865,12 +847,7 @@ public class SpoutEngine extends AsyncManager implements Engine {
 	}
 
 	@Override
-	public void runLocalDynamicUpdates(long time) throws InterruptedException {
-	}
-
-	@Override
-	public int runGlobalDynamicUpdates() throws InterruptedException {
-		return 0;
+	public void runDynamicUpdates(long time, int sequence) throws InterruptedException {
 	}
 
 	@Override
@@ -892,6 +869,7 @@ public class SpoutEngine extends AsyncManager implements Engine {
 
 	private class SessionTask implements Runnable {
 		final SpoutSessionRegistry registry;
+
 		SessionTask(SpoutSessionRegistry registry) {
 			this.registry = registry;
 		}

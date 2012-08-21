@@ -26,10 +26,14 @@
  */
 package org.spout.engine.world;
 
+import java.lang.ref.WeakReference;
+import java.util.concurrent.atomic.AtomicReference;
+
 import org.apache.commons.lang3.builder.HashCodeBuilder;
 import org.spout.api.Source;
 import org.spout.api.entity.component.controller.BlockController;
 import org.spout.api.generator.biome.Biome;
+import org.spout.api.geo.LoadOption;
 import org.spout.api.geo.World;
 import org.spout.api.geo.cuboid.Block;
 import org.spout.api.geo.cuboid.Chunk;
@@ -49,51 +53,69 @@ import org.spout.api.util.LogicUtil;
 import org.spout.api.util.StringUtil;
 
 public class SpoutBlock implements Block {
-	private int x, y, z;
-	private World world;
-	private Source source;
-	private Chunk chunk;
-
-	public SpoutBlock(Block source) {
-		this(source.getWorld(), source.getX(), source.getY(), source.getZ(), source.getSource());
-		if (source instanceof SpoutBlock) {
-			this.chunk = ((SpoutBlock) source).chunk;
-		}
-	}
-
-	public SpoutBlock(Point position, Source source) {
-		this(position.getWorld(), position.getBlockX(), position.getBlockY(), position.getBlockZ(), source);
-	}
+	private final int x, y, z;
+	private final WeakReference<World> world;
+	private final Source source;
+	private final AtomicReference<WeakReference<Chunk>> chunk;
 
 	public SpoutBlock(World world, int x, int y, int z, Source source) {
 		this(world, x, y, z, null, source);
 	}
 
-	public SpoutBlock(World world, int x, int y, int z, Chunk chunk, Source source) {
+	protected SpoutBlock(World world, int x, int y, int z, Chunk chunk, Source source) {
+		if (source == null) {
+			throw new IllegalArgumentException("Every block must have a source");
+		}
 		this.x = x;
 		this.y = y;
 		this.z = z;
-		this.world = world;
-		this.source = source == null ? world : source;
-		this.chunk = chunk != null && chunk.containsBlock(x, y, z) ? chunk : null;
+		if (world != null) {
+			this.world = ((SpoutWorld) world).getWeakReference();
+		} else {
+			this.world = SpoutWorld.NULL_WEAK_REFERENCE;
+		}
+		this.source = source;
+		if (chunk != null && !chunk.containsBlock(this.x, this.y, this.z)) {
+			chunk = null; // chunk does not contain this Block, invalidate
+		}
+		if (chunk != null) {
+			this.chunk = new AtomicReference<WeakReference<Chunk>>(((SpoutChunk) chunk).getWeakReference());
+		} else {
+			this.chunk = new AtomicReference<WeakReference<Chunk>>(SpoutChunk.NULL_WEAK_REFERENCE);
+		}
+	}
+
+	private final Chunk loadChunk() {
+		return getWorld().getChunkFromBlock(x, y, z, LoadOption.LOAD_GEN);
 	}
 
 	@Override
 	public Point getPosition() {
-		return new Point(this.world, this.x + 0.5f, this.y + 0.5f, this.z + 0.5f);
+		return new Point(getWorld(), this.x + 0.5f, this.y + 0.5f, this.z + 0.5f);
 	}
 
 	@Override
 	public Chunk getChunk() {
-		if (this.chunk == null || !this.chunk.isLoaded()) {
-			this.chunk = this.world.getChunkFromBlock(this.x, this.y, this.z);
+		WeakReference<Chunk> chunkRef = this.chunk.get();
+		if (chunkRef.get() == null || !chunkRef.get().isLoaded()) {
+			Chunk chunk = loadChunk();
+			if (chunk == null) {
+				this.chunk.set(SpoutChunk.NULL_WEAK_REFERENCE);
+			} else {
+				this.chunk.set(((SpoutChunk) chunk).getWeakReference());
+			}
+			return chunk;
 		}
-		return this.chunk;
+		return chunkRef.get();
 	}
 
 	@Override
 	public World getWorld() {
-		return this.world;
+		World world = this.world.get();
+		if (world == null) {
+			throw new IllegalStateException("The world has been unloaded!");
+		}
+		return world;
 	}
 
 	@Override
@@ -109,30 +131,6 @@ public class SpoutBlock implements Block {
 	@Override
 	public int getZ() {
 		return this.z;
-	}
-
-	@Override
-	public Block setX(int x) {
-		SpoutBlock sb = this.clone();
-		sb.x = x;
-		sb.chunk = null;
-		return sb;
-	}
-
-	@Override
-	public Block setY(int y) {
-		SpoutBlock sb = this.clone();
-		sb.y = y;
-		sb.chunk = null;
-		return sb;
-	}
-
-	@Override
-	public Block setZ(int z) {
-		SpoutBlock sb = this.clone();
-		sb.z = z;
-		sb.chunk = null;
-		return sb;
 	}
 
 	@Override
@@ -157,24 +155,16 @@ public class SpoutBlock implements Block {
 
 	@Override
 	public Block translate(int dx, int dy, int dz) {
-		SpoutBlock sb = this.clone();
-		sb.x += dx;
-		sb.y += dy;
-		sb.z += dz;
-		sb.chunk = null;
-		return sb;
+		return new SpoutBlock(getWorld(), this.x + dx, this.y + dy, this.z + dz, this.chunk.get().get(), this.source);
 	}
 
 	@Override
 	public Block getSurface() {
-		int height = this.world.getSurfaceHeight(this.x, this.z, true);
+		int height = getWorld().getSurfaceHeight(this.x, this.z, true);
 		if (height == this.y) {
 			return this;
 		} else {
-			SpoutBlock sb = this.clone();
-			sb.y = height;
-			sb.chunk = null;
-			return sb;
+			return new SpoutBlock(getWorld(), this.x, height, this.z, source);
 		}
 	}
 
@@ -196,18 +186,13 @@ public class SpoutBlock implements Block {
 	}
 
 	@Override
-	public SpoutBlock clone() {
-		return new SpoutBlock(this);
-	}
-
-	@Override
 	public boolean isAtSurface() {
-		return this.y >= this.world.getSurfaceHeight(this.x, this.z, true);
+		return this.y >= getWorld().getSurfaceHeight(this.x, this.z, true);
 	}
 
 	@Override
 	public String toString() {
-		return StringUtil.toNamedString(this, this.world, this.x, this.y, this.z);
+		return StringUtil.toNamedString(this, this.world.get(), this.x, this.y, this.z);
 	}
 
 	@Override
@@ -228,6 +213,12 @@ public class SpoutBlock implements Block {
 	@Override
 	public SpoutBlock setData(int data) {
 		this.getChunk().setBlockData(this.x, this.y, this.z, (short) data, this.source);
+		return this;
+	}
+
+	@Override
+	public SpoutBlock addData(int data) {
+		this.getChunk().addBlockData(this.x, this.y, this.z, (short) data, this.source);
 		return this;
 	}
 
@@ -267,20 +258,13 @@ public class SpoutBlock implements Block {
 	}
 
 	@Override
+	public int addDataField(int bits, int value) {
+		return this.getChunk().addBlockDataField(this.x, this.y, this.z, bits, value, this.source);
+	}
+
+	@Override
 	public Source getSource() {
 		return this.source;
-	}
-
-	@Override
-	public Block setSource(Source source) {
-		SpoutBlock block = this.clone();
-		block.source = source == null ? block.world : source;
-		return block;
-	}
-
-	@Override
-	public BlockMaterial getSubMaterial() {
-		return this.getMaterial().getSubMaterial(this.getData());
 	}
 
 	@Override
@@ -352,18 +336,23 @@ public class SpoutBlock implements Block {
 	}
 
 	public Block queueUpdate(EffectRange range) {
-		world.queueBlockPhysics(this.x, this.y, this.z, range, this.source);
+		getWorld().queueBlockPhysics(this.x, this.y, this.z, range, this.source);
 		return this;
 	}
 
 	@Override
 	public Biome getBiomeType() {
-		return world.getBiomeType(x, y, z);
+		return getWorld().getBiomeType(x, y, z);
 	}
 
 	@Override
 	public void resetDynamic() {
 		this.getRegion().resetDynamicBlock(this.x, this.y, this.z);
+	}
+	
+	@Override
+	public void syncResetDynamic() {
+		this.getRegion().syncResetDynamicBlock(this.x, this.y, this.z);
 	}
 
 	@Override
@@ -377,13 +366,8 @@ public class SpoutBlock implements Block {
 	}
 
 	@Override
-	public DynamicUpdateEntry dynamicUpdate(long updateTime, Object hint) {
-		return this.getRegion().queueDynamicUpdate(this.x, this.y, this.z, updateTime, hint);
-	}
-
-	@Override
-	public DynamicUpdateEntry dynamicUpdate(long updateTime, int data, Object hint) {
-		return this.getRegion().queueDynamicUpdate(this.x, this.y, this.z, updateTime, data, hint);
+	public DynamicUpdateEntry dynamicUpdate(long updateTime, int data) {
+		return this.getRegion().queueDynamicUpdate(this.x, this.y, this.z, updateTime, data);
 	}
 
 	@Override

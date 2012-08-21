@@ -32,13 +32,13 @@ import gnu.trove.set.hash.TIntHashSet;
 import java.util.ArrayList;
 import java.util.HashSet;
 import java.util.List;
+import java.util.Random;
 import java.util.Set;
 import java.util.TreeSet;
 import java.util.concurrent.ConcurrentHashMap;
 import java.util.concurrent.ConcurrentLinkedQueue;
 
 import org.spout.api.Spout;
-import org.spout.api.exception.IllegalTickSequenceException;
 import org.spout.api.geo.LoadOption;
 import org.spout.api.geo.cuboid.Block;
 import org.spout.api.geo.cuboid.Chunk;
@@ -95,12 +95,42 @@ public class DynamicBlockUpdateTree {
 		}
 	}
 	
+	public void syncResetBlockUpdates(int x, int y, int z) {
+		checkStages();
+		syncResetBlockUpdates(x, y, z, world.getAge(), false);
+	}
+	
+	private boolean syncResetBlockUpdates(int x, int y, int z, long currentTime, boolean triggerPlacement) {
+		x &= Region.BLOCKS.MASK;
+		y &= Region.BLOCKS.MASK;
+		z &= Region.BLOCKS.MASK;
+		
+		removeAll(DynamicBlockUpdate.getBlockPacked(x, y, z));
+
+		Chunk c = region.getChunkFromBlock(x, y, z, LoadOption.NO_LOAD);
+		if (c == null) {
+			return false;
+		}
+
+		if (triggerPlacement) {
+			Material m = c.getBlockMaterial(x, y, z);
+
+			if (m instanceof DynamicMaterial) {
+				Block b = c.getBlock(x, y, z, c.getWorld());
+
+				DynamicMaterial dm = (DynamicMaterial)m;
+				dm.onPlacement(b, region, currentTime);
+			}
+		}
+		return true;
+	}
+	
 	public DynamicUpdateEntry queueBlockUpdates(int x, int y, int z) {
 		checkStages();
 		x &= Region.BLOCKS.MASK;
 		y &= Region.BLOCKS.MASK;
 		z &= Region.BLOCKS.MASK;
-		return add(new DynamicBlockUpdate(x, y, z, 0, region.getWorld().getAge(), 0, null));
+		return add(new DynamicBlockUpdate(x, y, z, 0, 0));
 	}
 	
 	public DynamicUpdateEntry queueBlockUpdates(int x, int y, int z, long updateTime) {
@@ -108,33 +138,22 @@ public class DynamicBlockUpdateTree {
 		x &= Region.BLOCKS.MASK;
 		y &= Region.BLOCKS.MASK;
 		z &= Region.BLOCKS.MASK;
-		return add(new DynamicBlockUpdate(x, y, z, updateTime, region.getWorld().getAge(), 0, null));
+		return add(new DynamicBlockUpdate(x, y, z, updateTime, 0));
 	}
 	
-	public DynamicUpdateEntry queueBlockUpdates(int x, int y, int z, long updateTime, Object hint) {
+	public DynamicUpdateEntry queueBlockUpdates(int x, int y, int z, long updateTime, int data) {
 		checkStages();
 		x &= Region.BLOCKS.MASK;
 		y &= Region.BLOCKS.MASK;
 		z &= Region.BLOCKS.MASK;
-		return add(new DynamicBlockUpdate(x, y, z, updateTime, region.getWorld().getAge(), 0, hint));
-	}
-	
-	public DynamicUpdateEntry queueBlockUpdates(int x, int y, int z, long updateTime, int data, Object hint) {
-		checkStages();
-		x &= Region.BLOCKS.MASK;
-		y &= Region.BLOCKS.MASK;
-		z &= Region.BLOCKS.MASK;
-		return add(new DynamicBlockUpdate(x, y, z, updateTime, region.getWorld().getAge(), data, hint));
+		return add(new DynamicBlockUpdate(x, y, z, updateTime, data));
 	}
 	
 	private void checkStages() {
-		if (Thread.currentThread() == this.regionThread) {
-			TickStage.checkStage(localStages);
-		} else if (Thread.currentThread() == mainThread){
-			TickStage.checkStage(globalStages);
-		} else {
-			throw new IllegalTickSequenceException(TickStage.ALL_PHYSICS_AND_DYNAMIC, TickStage.getStageInt());
-		}
+		// Note: This is a weaker check that before
+		//       Access is open during the global update stages, but access should be 
+		//       restricted to neighbour in the sequence
+		TickStage.checkStage(globalStages, localStages, regionThread);
 	}
 	
 	public void addDynamicBlockUpdates(List<DynamicBlockUpdate> list) {
@@ -187,24 +206,11 @@ public class DynamicBlockUpdateTree {
 			if (!processed.add(packed)) {
 				continue;
 			}
-			int bx = p.getBlockX() & Region.BLOCKS.MASK;
-			int by = p.getBlockY() & Region.BLOCKS.MASK;
-			int bz = p.getBlockZ() & Region.BLOCKS.MASK;
+			int bx = p.getBlockX();
+			int by = p.getBlockY();
+			int bz = p.getBlockZ();
 			
-			removeAll(DynamicBlockUpdate.getBlockPacked(bx, by, bz));
-
-			Chunk c = region.getChunkFromBlock(bx, by, bz, LoadOption.NO_LOAD);
-			if (c == null) {
-				continue;
-			}
-
-			Block b =  c.getBlock(bx, by, bz);
-			Material m = b.getMaterial();
-			
-			if (m instanceof DynamicMaterial) {
-				DynamicMaterial dm = (DynamicMaterial)m;
-				dm.onPlacement(b, region, currentTime);
-			}
+			syncResetBlockUpdates(bx, by, bz, currentTime, true);
 		}
 		processed.clear();
 	}
@@ -223,7 +229,7 @@ public class DynamicBlockUpdateTree {
 		ArrayList<DynamicBlockUpdate> multiRegionUpdates = null;
 		
 		while ((first = getNextUpdate(thresholdTime)) != null) {
-			if (!updateDynamicBlock(currentTime, first, false)) {
+			if (!updateDynamicBlock(currentTime, first, false).isLocal()) {
 				if (multiRegionUpdates == null) {
 					multiRegionUpdates = new ArrayList<DynamicBlockUpdate>();
 				}
@@ -236,8 +242,8 @@ public class DynamicBlockUpdateTree {
 			return multiRegionUpdates;
 		}
 	}
-	
-	public boolean updateDynamicBlock(long currentTime, DynamicBlockUpdate update, boolean force) {
+
+	public UpdateResult updateDynamicBlock(long currentTime, DynamicBlockUpdate update, boolean force) {
 		checkStages();
 		int bx = update.getX();
 		int by = update.getY();
@@ -246,25 +252,25 @@ public class DynamicBlockUpdateTree {
 		Chunk c = region.getChunkFromBlock(bx, by, bz, LoadOption.NO_LOAD);
 
 		if (c == null) {
-			// TODO - this shouldn't happen - maybe a warning
-			return true;
+			return UpdateResult.NOT_DYNAMIC;
 		}
 		
-		Block b =  c.getBlock(bx, by, bz);
-		Material m = b.getMaterial();
+		
+		Material m = c.getBlockMaterial(bx, by, bz);
 		
 		if (!(m instanceof DynamicMaterial)) {
-			return true;
+			return UpdateResult.NOT_DYNAMIC;
 		}
 
 		DynamicMaterial dm = (DynamicMaterial)m;
 		EffectRange range = dm.getDynamicRange();
 		if (!force && !range.isRegionLocal(bx, by, bz)) {
-			return false;
+			return UpdateResult.NON_LOCAL;
 		} else {
-			dm.onDynamicUpdate(b, region, update.getNextUpdate(), update.getQueuedTime(), update.getData(), update.getHint());
+			Block b =  c.getBlock(bx, by, bz, c.getWorld());
+			dm.onDynamicUpdate(b, region, update.getNextUpdate(), update.getData());
 			lastUpdates++;
-			return true;
+			return UpdateResult.DONE;
 		}
 	}
 	
@@ -434,5 +440,17 @@ public class DynamicBlockUpdateTree {
 			current = current.getNext();
 		}
 		return oldRoot;
+	}
+	
+	public static enum UpdateResult {
+		NON_LOCAL, DONE, NOT_DYNAMIC;
+		
+		public boolean isLocal() {
+			return this != NON_LOCAL;
+		}
+		
+		public boolean isUpdated() {
+			return this == DONE;
+		}
 	}
 }

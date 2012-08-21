@@ -27,7 +27,9 @@
 package org.spout.engine.scheduler;
 
 import java.util.ArrayList;
+import java.util.Iterator;
 import java.util.List;
+import java.util.Queue;
 import java.util.concurrent.Callable;
 import java.util.concurrent.ConcurrentHashMap;
 import java.util.concurrent.Future;
@@ -70,7 +72,7 @@ public class SpoutTaskManager implements TaskManager {
 	}
 	
 	public SpoutTaskManager(Scheduler scheduler, boolean mainThread, Thread t, long age) {
-		this.taskQueue = new TaskPriorityQueue(t);
+		this.taskQueue = new TaskPriorityQueue(t, SpoutScheduler.PULSE_EVERY / 4);
 		this.mainThread = mainThread;
 		this.alive = new AtomicBoolean(true);
 		this.upTime = new AtomicLong(age);
@@ -125,17 +127,34 @@ public class SpoutTaskManager implements TaskManager {
 	
 	public void heartbeat(long delta) {
 		long upTime = this.upTime.addAndGet(delta);
-		while ((taskQueue.hasPendingTasks(upTime))) {
-			SpoutTask currentTask = taskQueue.getPendingTask(upTime);
-			if (!currentTask.isAlive()) {
-				continue;
-			} else if (currentTask.isSync()) {
-				currentTask.pulse();
-				repeatSchedule(currentTask);
-			} else {
-				SpoutWorker worker = new SpoutWorker(currentTask, this);
-				addWorker(worker, currentTask);
-				worker.start();
+		
+		Queue<SpoutTask> q;
+		
+		while ((q = taskQueue.poll(upTime)) != null) {
+			boolean checkRequired = !taskQueue.isFullyBelowThreshold(q, upTime);
+			Iterator<SpoutTask> itr = q.iterator();
+			while (itr.hasNext()) {
+				SpoutTask currentTask = itr.next();
+				if (checkRequired && currentTask.getPriority() > upTime) {
+					continue;
+				}
+				
+				itr.remove();
+				currentTask.setUnqueued();
+
+				if (!currentTask.isAlive()) {
+					continue;
+				} else if (currentTask.isSync()) {
+					currentTask.pulse();
+					repeatSchedule(currentTask);
+				} else {
+					SpoutWorker worker = new SpoutWorker(currentTask, this);
+					addWorker(worker, currentTask);
+					worker.start();
+				}
+			}
+			if (taskQueue.complete(q, upTime)) {
+				break;
 			}
 		}
 	}
@@ -158,7 +177,13 @@ public class SpoutTaskManager implements TaskManager {
 	public int schedule(SpoutTask task) {
 		synchronized (scheduleLock) {
 			addTask(task);
-			taskQueue.add(task);
+			if (task.getDelay() == 0 && task.getPeriod() < 0) {
+				SpoutWorker worker = new SpoutWorker(task, this);
+				addWorker(worker, task);
+				worker.start();
+			} else {
+				taskQueue.add(task);
+			}
 			return task.getTaskId();
 		}
 	}
@@ -220,7 +245,12 @@ public class SpoutTaskManager implements TaskManager {
 
 	@Override
 	public List<Task> getPendingTasks() {
-		return new ArrayList<Task>(taskQueue);
+		List<SpoutTask> tasks = taskQueue.getTasks();
+		List<Task> list = new ArrayList<Task>(tasks.size());
+		for (SpoutTask t : tasks) {
+			list.add(t);
+		}
+		return list;
 	}
 	
 	public boolean shutdown() {
@@ -233,46 +263,7 @@ public class SpoutTaskManager implements TaskManager {
 		}
 		alive.set(false);
 		cancelAllTasks();
-		long endTime = System.currentTimeMillis() + timeout;
-		boolean success = false;
-		while (!success && System.currentTimeMillis() < endTime) {
-			cancelAllTasks();
-			if (activeWorkers.isEmpty()) {
-				success = true;
-				continue;
-			}
-
-			try {
-				Thread.sleep(200);
-			} catch (InterruptedException e) {
-			}
-		}
-		if (!success) {
-			Logger logger = Spout.getEngine().getLogger();
-			logger.info("Forcing shutdown of tasks that did not properly shut down after " + timeout + "ms");
-			logger.info("Task id) Owner");
-			for (Worker worker : getActiveWorkers()) {
-				Task task = worker.getTask();
-				Thread thread = worker.getThread();
-				if (thread.isAlive()) {
-					Object owner = task.getOwner();
-					if (owner instanceof Plugin) {
-						Plugin plugin = (Plugin)owner;
-						logger.info("Task " + task.getTaskId() + ") " + plugin.getName());
-					} else if (owner != null) {
-						logger.info("Task " + task.getTaskId() + ") " + owner + " of type " + owner.getClass().getCanonicalName());
-					} else {
-						logger.info("Task " + task.getTaskId() + ") Owner is null");
-					}
-					thread.stop();
-				}
-			}
-			try {
-				Thread.sleep(2000);
-			} catch (InterruptedException ie) {
-			}
-		}
-		return success;
+		return true;
 	}
 	
 	@Override

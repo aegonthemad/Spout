@@ -37,17 +37,12 @@ import java.util.concurrent.atomic.AtomicReference;
 import java.util.logging.Level;
 
 import org.jboss.netty.channel.Channel;
-import org.jboss.netty.channel.ChannelFutureListener;
-import org.spout.api.Engine;
+import org.spout.api.Client;
 import org.spout.api.Spout;
 import org.spout.api.chat.style.ChatStyle;
 import org.spout.api.datatable.DataMap;
 import org.spout.api.datatable.DatatableMap;
 import org.spout.api.datatable.GenericDatatableMap;
-import org.spout.api.entity.Entity;
-import org.spout.api.event.player.PlayerKickEvent;
-import org.spout.api.event.player.PlayerLeaveEvent;
-import org.spout.api.event.storage.PlayerSaveEvent;
 import org.spout.api.map.DefaultedMap;
 import org.spout.api.protocol.Message;
 import org.spout.api.protocol.MessageHandler;
@@ -55,16 +50,14 @@ import org.spout.api.protocol.NetworkSynchronizer;
 import org.spout.api.protocol.NullNetworkSynchronizer;
 import org.spout.api.protocol.Protocol;
 import org.spout.api.protocol.Session;
-import org.spout.api.protocol.bootstrap.BootstrapProtocol;
-import org.spout.engine.SpoutServer;
+import org.spout.engine.SpoutEngine;
 import org.spout.engine.player.SpoutPlayer;
-import org.spout.engine.world.SpoutWorld;
 
 /**
  * A single connection to the server, which may or may not be associated with a
  * player.
  */
-public final class SpoutSession implements Session {
+public abstract class SpoutSession<T extends SpoutEngine> implements Session {
 	/**
 	 * The number of ticks which are elapsed before a client is disconnected due
 	 * to a timeout.
@@ -74,23 +67,25 @@ public final class SpoutSession implements Session {
 	/**
 	 * The server this session belongs to.
 	 */
-	private final SpoutServer server;
+	private final T engine;
 	/**
 	 * The Random for this session
 	 */
-	private final Random random = new Random();
+	protected final Random random = new Random();
 	/**
 	 * The channel associated with this session.
 	 */
-	private final Channel channel;
+	protected final Channel channel;
+	
 	/**
-	 * A queue of incoming and unprocessed messages.
+	 * A queue of unprocessed messages
 	 */
 	private final Queue<Message> messageQueue = new ArrayDeque<Message>();
+
 	/**
 	 * A queue of outgoing messages that will be sent after the client finishes identification
 	 */
-	private final Queue<Message> sendQueue = new ConcurrentLinkedQueue<Message>();
+	protected final Queue<Message> sendQueue = new ConcurrentLinkedQueue<Message>();
 	/**
 	 * The current state.
 	 */
@@ -98,7 +93,7 @@ public final class SpoutSession implements Session {
 	/**
 	 * The player associated with this session (if there is one).
 	 */
-	private SpoutPlayer player;
+	protected final AtomicReference<SpoutPlayer> player = new AtomicReference<SpoutPlayer>();
 	/**
 	 * The random long used for client-server handshake
 	 */
@@ -107,18 +102,12 @@ public final class SpoutSession implements Session {
 	 * The protocol for this session
 	 */
 	private final AtomicReference<Protocol> protocol;
-	/**
-	 * Stores the last block placement message to work around a bug in the
-	 * vanilla client where duplicate packets are sent.
-	 */
-	//private BlockPlacementMessage previousPlacement;
 
-	private final BootstrapProtocol bootstrapProtocol;
 	/**
 	 * Stores if this is Connected
-	 * @todo Probably add to SpoutAPI
+	 * TODO: Probably add to SpoutAPI
 	 */
-	private boolean isConnected = false;
+	protected boolean isConnected = false;
 
 	/**
 	 * A network synchronizer that doesn't do anything, used until a real synchronizer is set.
@@ -138,14 +127,13 @@ public final class SpoutSession implements Session {
 
 	/**
 	 * Creates a new session.
-	 * @param server  The server this session belongs to.
+	 * @param engine  The server this session belongs to.
 	 * @param channel The channel associated with this session.
 	 */
-	public SpoutSession(SpoutServer server, Channel channel, BootstrapProtocol bootstrapProtocol) {
-		this.server = server;
+	public SpoutSession(T engine, Channel channel, Protocol bootstrapProtocol) {
+		this.engine = engine;
 		this.channel = channel;
 		protocol = new AtomicReference<Protocol>(bootstrapProtocol);
-		this.bootstrapProtocol = bootstrapProtocol;
 		isConnected = true;
 		this.datatableMap = new GenericDatatableMap();
 		this.dataMap = new DataMap(this.datatableMap);
@@ -169,13 +157,18 @@ public final class SpoutSession implements Session {
 		this.state = state;
 	}
 
+	@Override
+	public boolean hasPlayer() {
+		return getPlayer() != null;
+	}
+
 	/**
 	 * Gets the player associated with this session.
 	 * @return The player, or {@code null} if no player is associated with it.
 	 */
 	@Override
 	public SpoutPlayer getPlayer() {
-		return player;
+		return player.get();
 	}
 
 	/**
@@ -185,11 +178,9 @@ public final class SpoutSession implements Session {
 	 *                               with this session.
 	 */
 	public void setPlayer(SpoutPlayer player) {
-		if (this.player != null) {
+		if (!this.player.compareAndSet(null, player)) {
 			throw new IllegalStateException();
 		}
-
-		this.player = player;
 	}
 
 	@SuppressWarnings("unchecked")
@@ -206,11 +197,11 @@ public final class SpoutSession implements Session {
 			MessageHandler<Message> handler = (MessageHandler<Message>) protocol.get().getHandlerLookupService().find(message.getClass());
 			if (handler != null) {
 				try {
-					handler.handle(this, player, message);
+					handler.handle(this, message);
 				} catch (Exception e) {
 					Spout.getEngine().getLogger().log(Level.SEVERE, "Message handler for " + message.getClass().getSimpleName() + " threw exception for player " + (getPlayer() != null ? getPlayer().getName() : "null"));
 					e.printStackTrace();
-					disconnect(false, "Message handler exception for " + message.getClass().getSimpleName());
+					disconnect(false, new Object[] {"Message handler exception for ", message.getClass().getSimpleName()});
 				}
 			}
 		}
@@ -228,6 +219,9 @@ public final class SpoutSession implements Session {
 	 */
 	@Override
 	public void send(boolean force, Message message) {
+		if (message == null) {
+			return;
+		}
 		try {
 			if (force || this.state == State.GAME) {
 				if (channel.isOpen()) {
@@ -237,7 +231,7 @@ public final class SpoutSession implements Session {
 				sendQueue.add(message);
 			}
 		} catch (Exception e) {
-			disconnect("Socket Error!", false);
+			disconnect(false, new Object[] {"Socket Error!"});
 		}
 	}
 
@@ -251,56 +245,6 @@ public final class SpoutSession implements Session {
 		for (Message msg : messages) {
 			send(force, msg);
 		}
-	}
-
-	@Override
-	public boolean disconnect(Object... reason) {
-		return disconnect(true, reason);
-	}
-
-	public Object[] getDefaultLeaveMessage() {
-		if (player == null) {
-			return new Object[] {ChatStyle.CYAN, "Unknown", ChatStyle.CYAN , " has left the game"};
-		} else {
-			return new Object[] {ChatStyle.CYAN, player.getDisplayName(), ChatStyle.CYAN, " has left the game"};
-		}
-	}
-
-	@Override
-	public boolean disconnect(Boolean kick, Object... reason) {
-		if (player != null) {
-			PlayerLeaveEvent event;
-			if (kick) {
-				event = getEngine().getEventManager().callEvent(new PlayerKickEvent(player, getDefaultLeaveMessage(), reason));
-				if (event.isCancelled()) {
-					return false;
-				}
-				reason = ((PlayerKickEvent) event).getKickReason();
-				server.getCommandSource().sendMessage("Player ", player.getName(), " kicked: ", reason);
-			} else {
-				event = new PlayerLeaveEvent(player, getDefaultLeaveMessage());
-			}
-			dispose(event);
-		}
-		Protocol protocol = getProtocol();
-		Message kickMessage = null;
-		if (protocol != null) {
-			kickMessage = protocol.getKickMessage(reason);
-		}
-		if (kickMessage != null) {
-			channel.write(kickMessage).addListener(ChannelFutureListener.CLOSE);
-		} else {
-			channel.close();
-		}
-		return true;
-	}
-
-	/**
-	 * Gets the server associated with this session.
-	 * @return The server.
-	 */
-	public SpoutServer getServer() {
-		return server;
 	}
 
 	/**
@@ -328,45 +272,8 @@ public final class SpoutSession implements Session {
 	 * @param <T>     The type of message.
 	 */
 	@Override
-	public <T extends Message> void messageReceived(T message) {
+	public void messageReceived(Message message) {
 		messageQueue.add(message);
-	}
-
-	@Override
-	public void dispose() {
-		dispose(new PlayerLeaveEvent(player, getDefaultLeaveMessage()));
-	}
-
-	public void dispose(PlayerLeaveEvent leaveEvent) {
-		if (player != null && isConnected) {
-			isConnected = false;
-
-			if (!leaveEvent.hasBeenCalled()) {
-				getEngine().getEventManager().callEvent(leaveEvent);
-			}
-
-			Object[] text = leaveEvent.getMessage();
-			if (text != null && text.length > 0) {
-				server.broadcastMessage(text);
-			}
-
-			PlayerSaveEvent saveEvent = getEngine().getEventManager().callEvent(new PlayerSaveEvent(player));
-			if (!saveEvent.isSaved()) {
-
-			}
-
-			//If its null or can't be get, just ignore it
-			//If disconnect fails, we just ignore it for now.
-			try {
-				final Entity entity = player.getEntity();
-				if (entity != null) {
-					((SpoutWorld) entity.getWorld()).removePlayer(player);
-				}
-				player.disconnect();
-			} catch (Exception e) {
-			}
-			player = null; // in case we are disposed twice
-		}
 	}
 
 	@Override
@@ -383,22 +290,13 @@ public final class SpoutSession implements Session {
 	}*/
 
 	@Override
-	public void setProtocol(Protocol protocol) {
-		if (!this.protocol.compareAndSet(bootstrapProtocol, protocol)) {
-			throw new IllegalArgumentException("The protocol may only be set once per session");
-		}
-
-		server.getLogger().info("Setting protocol to " + protocol.getName());
-	}
-	
-	@Override
 	public Protocol getProtocol() {
 		return this.protocol.get();
 	}
 
 	@Override
-	public Engine getEngine() {
-		return server;
+	public T getEngine() {
+		return engine;
 	}
 
 	@Override
@@ -417,11 +315,23 @@ public final class SpoutSession implements Session {
 			this.synchronizer.set(nullSynchronizer);
 		} else if (!this.synchronizer.compareAndSet(nullSynchronizer, synchronizer)) {
 			throw new IllegalArgumentException("Network synchronizer may only be set once for a given player login");
+		} else if (synchronizer != null) {
+			synchronizer.setProtocol(protocol.get());
+			this.synchronizer.set(synchronizer);
 		}
+	}
+
+	public void bindAuxChannel(Channel c) {
+		throw new UnsupportedOperationException("bindAuxChannel() is only supported for proxies");
+	}
+
+	public void closeAuxChannel() {
+		throw new UnsupportedOperationException("closeAuxChannel() is only supported for proxies");
 	}
 
 	@Override
 	public NetworkSynchronizer getNetworkSynchronizer() {
 		return synchronizer.get();
 	}
+
 }

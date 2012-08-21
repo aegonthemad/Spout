@@ -59,6 +59,9 @@ import org.spout.api.math.Quaternion;
 import org.spout.api.math.Vector3;
 import org.spout.api.util.NBTMapper;
 import org.spout.api.util.StringMap;
+import org.spout.api.util.hashing.ArrayHash;
+import org.spout.api.util.hashing.ByteTripleHashed;
+import org.spout.api.util.hashing.SignedTenBitTripleHashed;
 import org.spout.api.util.sanitation.SafeCast;
 import org.spout.api.util.sanitation.StringSanitizer;
 import org.spout.api.util.typechecker.TypeChecker;
@@ -132,6 +135,8 @@ public class WorldFiles {
 				}
 			}
 		}
+
+		world.getItemMap().save();
 	}
 
 	public static SpoutWorld loadWorldFromData(String name, WorldGenerator generator, StringMap global) {
@@ -207,7 +212,7 @@ public class WorldFiles {
 		}
 
 		long age = SafeCast.toLong(NBTMapper.toTagValue(map.get("age")), 0L);
-		world = new SpoutWorld(name, Spout.getEngine(), seed, age, generator, new UUID(msb, lsb), itemMap, extraData);
+		world = new SpoutWorld(name, (SpoutEngine) Spout.getEngine(), seed, age, generator, new UUID(msb, lsb), itemMap, extraData);
 
 		List<? extends FloatTag> spawnPosition = checkerListFloatTag.checkTag(map.get("spawn_position"));
 		Transform spawn = NBTMapper.nbtToTransform(world, spawnPosition);
@@ -253,7 +258,7 @@ public class WorldFiles {
 		}
 
 		long age = SafeCast.toLong(NBTMapper.toTagValue(map.get("age")), 0L);
-		world = new SpoutWorld(name, Spout.getEngine(), seed, age, generator, new UUID(msb, lsb), itemMap, extraData);
+		world = new SpoutWorld(name, (SpoutEngine) Spout.getEngine(), seed, age, generator, new UUID(msb, lsb), itemMap, extraData);
 
 		return world;
 	}
@@ -307,6 +312,8 @@ public class WorldFiles {
 				}
 			}
 		}
+
+		world.getItemMap().save();
 	}
 
 	public static SpoutChunk loadChunk(SpoutRegion r, int x, int y, int z, InputStream dis, ChunkDataForRegion dataForRegion) {
@@ -365,7 +372,7 @@ public class WorldFiles {
 
 			chunk = new FilteredChunk(r.getWorld(), r, cx, cy, cz, PopulationState.byID(populationState), blocks, data, skyLight, blockLight, manager, extraDataMap);
 
-			CompoundMap entityMap = SafeCast.toGeneric(NBTMapper.toTagValue(map.get("entities")), null, CompoundMap.class);
+			CompoundMap entityMap = SafeCast.toGeneric(NBTMapper.toTagValue(map.get("entities")), (CompoundMap) null, CompoundMap.class);
 			loadEntities(r, entityMap, dataForRegion.loadedEntities);
 
 			List<? extends CompoundTag> updateList = checkerListCompoundTag.checkTag(map.get("dynamic_updates"), null);
@@ -537,9 +544,8 @@ public class WorldFiles {
 	private static CompoundTag saveDynamicUpdate(DynamicBlockUpdate update) {
 		CompoundMap map = new CompoundMap();
 
-		map.put(new IntTag("packed", update.getPacked()));
+		map.put(new IntTag("packedv2", update.getPacked()));
 		map.put(new LongTag("nextUpdate", update.getNextUpdate()));
-		map.put(new LongTag("queuedTime", update.getQueuedTime()));
 		map.put(new IntTag("data", update.getData()));
 
 		return new CompoundTag("update", map);
@@ -562,9 +568,17 @@ public class WorldFiles {
 
 	private static DynamicBlockUpdate loadDynamicUpdate(CompoundTag compoundTag) {
 		final CompoundMap map = compoundTag.getValue();
-		final int packed = SafeCast.toInt(NBTMapper.toTagValue(map.get("packed")), -1);
-		if (packed < 0) {
-			return null;
+		int packed = SafeCast.toInt(NBTMapper.toTagValue(map.get("packedv2")), -1);
+		if (packed == -1) {
+			packed = SafeCast.toInt(NBTMapper.toTagValue(map.get("packed")), -1);
+			if (packed < 0) {
+				return null;
+			} else {
+				int x = 0xFF & ByteTripleHashed.key1(packed);
+				int y = 0xFF & ByteTripleHashed.key2(packed);
+				int z = 0xFF & ByteTripleHashed.key3(packed);
+				packed = SignedTenBitTripleHashed.key(x, y, z);
+			}
 		}
 
 		final long nextUpdate = SafeCast.toLong(NBTMapper.toTagValue(map.get("nextUpdate")), -1L);
@@ -572,8 +586,7 @@ public class WorldFiles {
 			return null;
 		}
 
-		final long queuedTime = SafeCast.toLong(NBTMapper.toTagValue(map.get("queuedTime")), -1L);
 		final int data = SafeCast.toInt(NBTMapper.toTagValue(map.get("data")), 0);
-		return new DynamicBlockUpdate(packed, nextUpdate, queuedTime, data, null);
+		return new DynamicBlockUpdate(packed, nextUpdate, data);
 	}
 }

@@ -24,12 +24,29 @@
  * License and see <http://www.spout.org/SpoutDevLicenseV1.txt> for the full license,
  * including the MIT license.
  */
-package org.spout.engine.util;
+package org.spout.engine.command;
 
-import org.spout.api.render.RenderMode;
+import org.spout.api.Client;
+import org.spout.api.command.CommandContext;
+import org.spout.api.command.CommandSource;
+import org.spout.api.command.annotated.Command;
+import org.spout.api.command.annotated.Executor;
+import org.spout.api.exception.CommandException;
+import org.spout.api.plugin.Platform;
+import org.spout.engine.SpoutEngine;
 
-public class RenderModeConverter extends EnumConverter<RenderMode> {
-	public RenderModeConverter() {
-		super(RenderMode.class);
+public class InputCommands {
+	private final SpoutEngine engine;
+
+	public InputCommands(SpoutEngine engine) {
+		this.engine = engine;
+	}
+
+	@Command(aliases = {"bind"}, usage = "bind <key> <command>", desc = "Binds a command to a key", min = 2)
+	public class BindCommand {
+		@Executor(Platform.CLIENT)
+		public void bind(CommandContext args, CommandSource source) throws CommandException {
+			((Client) engine).getInput().bind(args.getString(0), args.getJoinedString(1).getPlainString());
+		}
 	}
 }
