@@ -24,63 +24,23 @@
  * License and see <http://www.spout.org/SpoutDevLicenseV1.txt> for the full license,
  * including the MIT license.
  */
-package org.spout.engine.chat.console;
+package org.spout.engine.protocol.builtin.handler;
 
-import java.text.DateFormat;
-import java.util.ArrayList;
-import java.util.Arrays;
-import java.util.Collections;
-import java.util.List;
+import org.spout.api.entity.Player;
+import org.spout.api.entity.state.PlayerInputState;
+import org.spout.api.protocol.ServerMessageHandler;
+import org.spout.api.protocol.Session;
+import org.spout.api.protocol.builtin.message.PlayerInputMessage;
 
-import org.spout.api.chat.ChatArguments;
-
-/**
- * A wrapper console that allows accessing multiple consoles at once
- */
-public class MultiConsole implements Console {
-	private final List<Console> consoles = new ArrayList<Console>();
-
-	public MultiConsole() {
-
-	}
-
-	public MultiConsole(Console... consoles) {
-		this.consoles.addAll(Arrays.asList(consoles));
-	}
-
-	public List<Console> getConsoles() {
-		return Collections.unmodifiableList(consoles);
-	}
-
-	public boolean removeConsole(Console console) {
-		return consoles.remove(console);
-	}
-
-	public void addConsole(Console console) {
-		consoles.add(console);
-	}
-
-	public void init() {
-		for (Console console : consoles) {
-			console.init();
+public class PlayerInputMessageHandler implements ServerMessageHandler<PlayerInputMessage> {
+	@Override
+	public void handle(Session session, PlayerInputMessage message) {
+		if(!session.hasPlayer()) {
+			return;
 		}
-	}
-
-	public void close() {
-		for (Console console : consoles) {
-			console.close();
-		}
-	}
-
-	public void setDateFormat(DateFormat format) {
-		for (Console console : consoles) {
-			console.setDateFormat(format);
-		}
-	}
-
-	public void addMessage(ChatArguments message) {
-		for (Console console : consoles) {
-			console.addMessage(message);
-		}
+		
+		Player player = session.getPlayer();
+	    PlayerInputState inputState = new PlayerInputState(message.getInputFlags(), (byte)message.getMouseDx(), (byte)message.getMouseDy() );
+		player.processInput(inputState);
 	}
 }

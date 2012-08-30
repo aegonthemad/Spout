@@ -31,6 +31,7 @@ import java.io.InputStream;
 import java.io.OutputStream;
 import java.io.Serializable;
 import java.lang.ref.WeakReference;
+import java.util.ArrayList;
 import java.util.Collection;
 import java.util.Collections;
 import java.util.HashSet;
@@ -42,6 +43,7 @@ import java.util.UUID;
 import java.util.concurrent.ConcurrentHashMap;
 
 import org.apache.commons.lang3.builder.HashCodeBuilder;
+
 import org.spout.api.Source;
 import org.spout.api.Spout;
 import org.spout.api.collision.BoundingBox;
@@ -50,10 +52,14 @@ import org.spout.api.collision.CollisionVolume;
 import org.spout.api.datatable.DataMap;
 import org.spout.api.datatable.DatatableMap;
 import org.spout.api.datatable.GenericDatatableMap;
+import org.spout.api.entity.Controller;
 import org.spout.api.entity.Entity;
-import org.spout.api.entity.component.Controller;
-import org.spout.api.entity.component.controller.BlockController;
+import org.spout.api.entity.Player;
+import org.spout.api.entity.controller.BlockController;
+import org.spout.api.entity.controller.type.ControllerType;
+import org.spout.api.entity.spawn.SpawnArrangement;
 import org.spout.api.event.block.CuboidChangeEvent;
+import org.spout.api.event.entity.EntitySpawnEvent;
 import org.spout.api.generator.WorldGenerator;
 import org.spout.api.generator.biome.Biome;
 import org.spout.api.generator.biome.BiomeGenerator;
@@ -66,19 +72,24 @@ import org.spout.api.geo.discrete.Transform;
 import org.spout.api.io.bytearrayarray.BAAWrapper;
 import org.spout.api.map.DefaultedMap;
 import org.spout.api.material.BlockMaterial;
+import org.spout.api.material.DynamicUpdateEntry;
 import org.spout.api.material.range.EffectRange;
 import org.spout.api.math.MathHelper;
 import org.spout.api.math.Quaternion;
 import org.spout.api.math.Vector3;
-import org.spout.api.player.Player;
 import org.spout.api.plugin.Plugin;
 import org.spout.api.scheduler.TaskManager;
 import org.spout.api.util.StringMap;
 import org.spout.api.util.cuboid.CuboidBuffer;
 import org.spout.api.util.hashing.IntPairHashed;
 import org.spout.api.util.hashing.NibblePairHashed;
+import org.spout.api.util.list.concurrent.ConcurrentList;
 import org.spout.api.util.map.concurrent.TSyncIntPairObjectHashMap;
 import org.spout.api.util.map.concurrent.TSyncLongObjectHashMap;
+
+import org.spout.api.util.sanitation.StringSanitizer;
+import org.spout.api.util.thread.LiveRead;
+import org.spout.api.util.thread.Threadsafe;
 import org.spout.engine.SpoutEngine;
 import org.spout.engine.entity.EntityManager;
 import org.spout.engine.entity.SpoutEntity;
@@ -88,12 +99,29 @@ import org.spout.engine.scheduler.SpoutParallelTaskManager;
 import org.spout.engine.scheduler.SpoutScheduler;
 import org.spout.engine.scheduler.SpoutTaskManager;
 import org.spout.engine.util.thread.AsyncExecutor;
+import org.spout.engine.util.thread.AsyncManager;
 import org.spout.engine.util.thread.ThreadAsyncExecutor;
 import org.spout.engine.util.thread.snapshotable.SnapshotManager;
 import org.spout.engine.util.thread.snapshotable.SnapshotableLong;
 
-public final class SpoutWorld extends SpoutAbstractWorld implements World {
+public class SpoutWorld extends AsyncManager implements World {
 	private SnapshotManager snapshotManager = new SnapshotManager();
+	/**
+	 * The server of this world.
+	 */
+	private final SpoutEngine engine;
+	/**
+	 * The name of this world.
+	 */
+	private final String name;
+	/**
+	 * The world's UUID.
+	 */
+	private final UUID uid;
+	/**
+	 * String item map, used to convert local id's to the server id
+	 */
+	private final StringMap itemMap;
 	/**
 	 * The region source
 	 */
@@ -115,13 +143,9 @@ public final class SpoutWorld extends SpoutAbstractWorld implements World {
 	 */
 	private final WorldGenerator generator;
 	/**
-	 * Holds all of the entities to be simulated
-	 */
-	private final EntityManager entityManager;
-	/**
 	 * A set of all players currently connected to this world
 	 */
-	private final Set<Player> players = Collections.newSetFromMap(new ConcurrentHashMap<Player, Boolean>());
+	private final List<Player> players = new ConcurrentList<Player>();
 	/**
 	 * A map of the loaded columns
 	 */
@@ -139,36 +163,25 @@ public final class SpoutWorld extends SpoutAbstractWorld implements World {
 	 * The async thread which handles the calculation of block and sky lighting in the world
 	 */
 	private final SpoutWorldLighting lightingManager;
-
 	/**
 	 * The parallel task manager.  This is used for submitting tasks to all regions in the world.
 	 */
 	protected final SpoutParallelTaskManager parallelTaskManager;
-
 	private final SpoutTaskManager taskManager;
-
 	/**
 	 * The sky light level the sky emits
 	 */
 	private byte skyLightLevel = 15;
-
 	/**
 	 * Hashcode cache
 	 */
 	private final int hashcode;
-
 	/**
 	 * Data map and Datatable associated with it
 	 */
 	private final DatatableMap datatableMap;
 	private final DataMap dataMap;
-
-	/**
-	 * String item map, used to convert local id's to the server id
-	 */
-	private final StringMap itemMap;
-	
-	/**
+	/*
 	 * A WeakReference to this world
 	 */
 	private final WeakReference<World> selfReference;
@@ -176,12 +189,18 @@ public final class SpoutWorld extends SpoutAbstractWorld implements World {
 
 	// TODO set up number of stages ?
 	public SpoutWorld(String name, SpoutEngine engine, long seed, long age, WorldGenerator generator, UUID uid, StringMap itemMap, DatatableMap extraData) {
-		super(name, uid, engine, 1, new ThreadAsyncExecutor(toString(name, uid, age)));
+		super(1, new ThreadAsyncExecutor(toString(name, uid, age)), engine);
+		this.engine = engine;
+		if (!StringSanitizer.isAlphaNumericUnderscore(name)) {
+			name = Long.toHexString(System.currentTimeMillis());
+			Spout.getEngine().getLogger().severe("World name " + name + " is not valid, using " + name + " instead");
+		}
+		this.name = name;
+		this.uid = uid;
+		this.itemMap = itemMap;
 		this.seed = seed;
 
 		this.generator = generator;
-		this.itemMap = itemMap;
-		entityManager = new EntityManager();
 		regions = new RegionSource(this, snapshotManager);
 
 		worldDirectory = new File(SharedFileSystem.WORLDS_DIRECTORY, name);
@@ -206,7 +225,7 @@ public final class SpoutWorld extends SpoutAbstractWorld implements World {
 		AsyncExecutor e = getExecutor();
 		Thread t;
 		if (e instanceof Thread) {
-			t = (Thread)e;
+			t = (Thread) e;
 		} else {
 			throw new IllegalStateException("AsyncExecutor should be instance of Thread");
 		}
@@ -217,9 +236,32 @@ public final class SpoutWorld extends SpoutAbstractWorld implements World {
 		selfReference = new WeakReference<World>(this);
 	}
 
+	public String getName() {
+		return name;
+	}
+
+	public UUID getUID() {
+		return uid;
+	}
+
 	@Override
 	public long getAge() {
 		return age.get();
+	}
+
+	@Override
+	public SpoutBlock getBlock(int x, int y, int z, Source source) {
+		return new SpoutBlock(this, x, y, z, source);
+	}
+
+	@Override
+	public SpoutBlock getBlock(float x, float y, float z, Source source) {
+		return this.getBlock(MathHelper.floor(x), MathHelper.floor(y), MathHelper.floor(z), source);
+	}
+
+	@Override
+	public SpoutBlock getBlock(Vector3 position, Source source) {
+		return this.getBlock(position.getX(), position.getY(), position.getZ(), source);
 	}
 
 	@Override
@@ -251,6 +293,180 @@ public final class SpoutWorld extends SpoutAbstractWorld implements World {
 		return chunk.getBiomeType(x, y, z);
 	}
 
+	public SpoutRegion getRegion(int x, int y, int z) {
+		return getRegion(x, y, z, LoadOption.LOAD_GEN);
+	}
+
+	@Override
+	public SpoutRegion getRegionFromChunk(int x, int y, int z) {
+		return getRegionFromChunk(x, y, z, LoadOption.LOAD_GEN);
+	}
+
+	@Override
+	public SpoutRegion getRegionFromChunk(int x, int y, int z, LoadOption loadopt) {
+		return getRegion(x >> Region.CHUNKS.BITS, y >> Region.CHUNKS.BITS, z >> Region.CHUNKS.BITS, loadopt);
+	}
+
+	@Override
+	public SpoutRegion getRegionFromBlock(Vector3 position) {
+		return getRegionFromBlock(position, LoadOption.LOAD_GEN);
+	}
+
+	@Override
+	public SpoutRegion getRegionFromBlock(Vector3 position, LoadOption loadopt) {
+		return this.getRegionFromBlock(position.getFloorX(), position.getFloorY(), position.getFloorZ(), loadopt);
+	}
+
+	@Override
+	public SpoutRegion getRegionFromBlock(int x, int y, int z) {
+		return getRegionFromBlock(x, y, z, LoadOption.LOAD_GEN);
+	}
+
+	@Override
+	public SpoutRegion getRegionFromBlock(int x, int y, int z, LoadOption loadopt) {
+		return getRegion(x >> Region.BLOCKS.BITS, y >> Region.BLOCKS.BITS, z >> Region.BLOCKS.BITS, loadopt);
+	}
+
+	@Override
+	public SpoutChunk getChunk(int x, int y, int z) {
+		return this.getChunk(x, y, z, LoadOption.LOAD_GEN);
+	}
+
+	@Override
+	public SpoutChunk getChunkFromBlock(int x, int y, int z) {
+		return this.getChunkFromBlock(x, y, z, LoadOption.LOAD_GEN);
+	}
+
+	@Override
+	public SpoutChunk getChunkFromBlock(int x, int y, int z, LoadOption loadopt) {
+		return this.getChunk(x >> Chunk.BLOCKS.BITS, y >> Chunk.BLOCKS.BITS, z >> Chunk.BLOCKS.BITS, loadopt);
+	}
+
+	@Override
+	public SpoutChunk getChunkFromBlock(Vector3 position) {
+		return this.getChunkFromBlock(position, LoadOption.LOAD_GEN);
+	}
+
+	@Override
+	public SpoutChunk getChunkFromBlock(Vector3 position, LoadOption loadopt) {
+		return this.getChunkFromBlock(position.getFloorX(), position.getFloorY(), position.getFloorZ(), loadopt);
+	}
+
+	@Override
+	public boolean setBlockMaterial(int x, int y, int z, BlockMaterial material, short data, Source source) {
+		return this.getChunkFromBlock(x, y, z).setBlockMaterial(x, y, z, material, data, source);
+	}
+
+	@Override
+	public boolean setBlockData(int x, int y, int z, short data, Source source) {
+		return getChunkFromBlock(x, y, z).setBlockData(x, y, z, data, source);
+	}
+
+	@Override
+	public boolean addBlockData(int x, int y, int z, short data, Source source) {
+		return getChunkFromBlock(x, y, z).addBlockData(x, y, z, data, source);
+	}
+
+	@Override
+	public int getBlockFullState(int x, int y, int z) {
+		return getChunkFromBlock(x, y, z).getBlockFullState(x, y, z);
+	}
+
+	@Override
+	public BlockMaterial getBlockMaterial(int x, int y, int z) {
+		return getChunkFromBlock(x, y, z).getBlockMaterial(x, y, z);
+	}
+
+	@Override
+	public short getBlockData(int x, int y, int z) {
+		return getChunkFromBlock(x, y, z).getBlockData(x, y, z);
+	}
+
+	@Override
+	public byte getBlockSkyLight(int x, int y, int z) {
+		return getChunkFromBlock(x, y, z).getBlockSkyLight(x, y, z);
+	}
+
+	@Override
+	public byte getBlockSkyLightRaw(int x, int y, int z) {
+		return getChunkFromBlock(x, y, z).getBlockSkyLightRaw(x, y, z);
+	}
+
+	@Override
+	public byte getBlockLight(int x, int y, int z) {
+		return getChunkFromBlock(x, y, z).getBlockLight(x, y, z);
+	}
+
+	@Override
+	public boolean compareAndSetData(int x, int y, int z, int expect, short data, Source source) {
+		return getChunkFromBlock(x, y, z).compareAndSetData(x, y, z, expect, data, source);
+	}
+
+	@Override
+	public short setBlockDataBits(int x, int y, int z, int bits, boolean set, Source source) {
+		return getChunkFromBlock(x, y, z).setBlockDataBits(x, y, z, bits, set, source);
+	}
+
+	@Override
+	public short setBlockDataBits(int x, int y, int z, int bits, Source source) {
+		return getChunkFromBlock(x, y, z).setBlockDataBits(x, y, z, bits, source);
+	}
+
+	@Override
+	public short clearBlockDataBits(int x, int y, int z, int bits, Source source) {
+		return getChunkFromBlock(x, y, z).clearBlockDataBits(x, y, z, bits, source);
+	}
+
+	@Override
+	public int getBlockDataField(int x, int y, int z, int bits) {
+		return getChunkFromBlock(x, y, z).getBlockDataField(x, y, z, bits);
+	}
+
+	@Override
+	public boolean isBlockDataBitSet(int x, int y, int z, int bits) {
+		return getChunkFromBlock(x, y, z).isBlockDataBitSet(x, y, z, bits);
+	}
+
+	@Override
+	public int setBlockDataField(int x, int y, int z, int bits, int value, Source source) {
+		return getChunkFromBlock(x, y, z).setBlockDataField(x, y, z, bits, value, source);
+	}
+
+	@Override
+	public int addBlockDataField(int x, int y, int z, int bits, int value, Source source) {
+		return getChunkFromBlock(x, y, z).addBlockDataField(x, y, z, bits, value, source);
+	}
+
+	@Override
+	public void resetDynamicBlock(int x, int y, int z) {
+		this.getRegionFromBlock(x, y, z).resetDynamicBlock(x, y, z);
+	}
+
+	@Override
+	public void syncResetDynamicBlock(int x, int y, int z) {
+		this.getRegionFromBlock(x, y, z).syncResetDynamicBlock(x, y, z);
+	}
+
+	@Override
+	public DynamicUpdateEntry queueDynamicUpdate(int x, int y, int z, long nextUpdate, int data) {
+		return this.getRegionFromBlock(x, y, z).queueDynamicUpdate(x, y, z, nextUpdate, data);
+	}
+
+	@Override
+	public DynamicUpdateEntry queueDynamicUpdate(int x, int y, int z, long nextUpdate) {
+		return this.getRegionFromBlock(x, y, z).queueDynamicUpdate(x, y, z, nextUpdate);
+	}
+
+	@Override
+	public DynamicUpdateEntry queueDynamicUpdate(int x, int y, int z) {
+		return this.getRegionFromBlock(x, y, z).queueDynamicUpdate(x, y, z);
+	}
+
+
+	public StringMap getItemMap() {
+		return itemMap;
+	}
+
 	@Override
 	public int hashCode() {
 		return hashcode;
@@ -270,8 +486,38 @@ public final class SpoutWorld extends SpoutAbstractWorld implements World {
 	}
 
 	@Override
+	public int getSurfaceHeight(int x, int z, boolean load) {
+		SpoutColumn column = getColumn(x, z, load);
+		if (column == null) {
+			return Integer.MIN_VALUE;
+		}
+
+		return column.getSurfaceHeight(x, z);
+	}
+
+	@Override
+	public int getSurfaceHeight(int x, int z) {
+		return getSurfaceHeight(x, z, false);
+	}
+
+	@Override
+	public BlockMaterial getTopmostBlock(int x, int z, boolean load) {
+		SpoutColumn column = getColumn(x, z, load);
+		if (column == null) {
+			return null;
+		}
+
+		return column.getTopmostBlock(x, z);
+	}
+
+	@Override
+	public BlockMaterial getTopmostBlock(int x, int z) {
+		return getTopmostBlock(x, z, false);
+	}
+
+	@Override
 	public Entity createEntity(Point point, Controller controller) {
-		return new SpoutEntity((SpoutEngine) getEngine(), point, controller);
+		return new SpoutEntity(getEngine(), point, controller);
 	}
 
 	/**
@@ -282,12 +528,79 @@ public final class SpoutWorld extends SpoutAbstractWorld implements World {
 		if (e.isSpawned()) {
 			throw new IllegalArgumentException("Cannot spawn an entity that is already spawned!");
 		}
-		((SpoutRegion) e.getRegion()).addEntity(e);
+		SpoutRegion region = (SpoutRegion) e.getRegion();
+		if (region == null) {
+			throw new IllegalStateException("Cannot spawn an entity that has a null region!");
+		}
+		if (region.getEntityManager().isSpawnable((SpoutEntity) e)) {
+			EntitySpawnEvent event = Spout.getEventManager().callEvent(new EntitySpawnEvent(e, e.getPosition()));
+			if (event.isCancelled()) {
+				return;
+			}
+			region.addEntity(e);
+		} else {
+			throw new IllegalStateException("Cannot spawn an entity that already has an id!");
+		}
+	}
+
+	@Override
+	public Entity createAndSpawnEntity(Point point, Controller controller) {
+		SpoutRegion region = getRegionFromBlock(point, LoadOption.NO_LOAD);
+		if (region == null) {
+			if (!(controller.getParent() instanceof Player)) {
+				throw new IllegalStateException("Cannot spawn a non-player entity in a region that isn't loaded!");
+			}
+			//Load and generate for players
+			region.load(LoadOption.LOAD_GEN); // TODO: De-lawl this
+		}
+		Entity e = createEntity(point, controller);
+		//initialize region if needed (only for players)
+		spawnEntity(e);
+		return e;
+	}
+
+	@Override
+	public Entity[] createAndSpawnEntity(Point[] points, Controller[] controllers) {
+		if (points.length != controllers.length) {
+			throw new IllegalArgumentException("Point and controller array must be of equal length");
+		}
+		Entity[] entities = new Entity[points.length];
+		for (int i = 0; i < points.length; i++) {
+			entities[i] = createAndSpawnEntity(points[i], controllers[i]);
+		}
+		return entities;
+	}
+
+	@Override
+	public Entity[] createAndSpawnEntity(Point[] points, ControllerType[] types) {
+		Entity[] entities = new Entity[points.length];
+		for (int i = 0; i < points.length; i++) {
+			entities[i] = createAndSpawnEntity(points[i], types[i].createController());
+		}
+		return entities;
+	}
+
+	@Override
+	public Entity[] createAndSpawnEntity(Point[] points, ControllerType type) {
+		Entity[] entities = new Entity[points.length];
+		for (int i = 0; i < points.length; i++) {
+			entities[i] = createAndSpawnEntity(points[i], type.createController());
+		}
+		return entities;
+	}
+
+	@Override
+	public Entity[] createAndSpawnEntity(SpawnArrangement arrangement) {
+		ControllerType[] types = arrangement.getControllerTypes();
+		if (types.length == 1) {
+			return createAndSpawnEntity(arrangement.getArrangement(), types[0]);
+		}
+
+		return createAndSpawnEntity(arrangement.getArrangement(), types);
 	}
 
 	@Override
 	public void copySnapshotRun() throws InterruptedException {
-		entityManager.copyAllSnapshots();
 		snapshotManager.copyAllSnapshots();
 	}
 
@@ -300,20 +613,10 @@ public final class SpoutWorld extends SpoutAbstractWorld implements World {
 			case 0: {
 				parallelTaskManager.heartbeat(delta);
 				taskManager.heartbeat(delta);
-				float dt = delta / 1000.f;
-				//Update all entities
-				for (SpoutEntity ent : entityManager) {
-					try {
-						ent.tick(dt);
-					} catch (Exception e) {
-						Spout.getEngine().getLogger().severe("Unhandled exception during tick for " + ent.toString());
-						e.printStackTrace();
-					}
-				}
 				break;
 			}
 			default: {
-				throw new IllegalStateException("Number of states exceeded limit for SpoutRegion");
+				throw new IllegalStateException("Number of states exceeded limit for SpoutWorld");
 			}
 		}
 	}
@@ -337,6 +640,11 @@ public final class SpoutWorld extends SpoutAbstractWorld implements World {
 	public long getSeed() {
 		return seed;
 	}
+
+	public SpoutEngine getEngine() {
+		return engine;
+	}
+
 	/**
 	 * Gets the lighting manager that calculates the light for this world
 	 * @return world lighting manager
@@ -385,13 +693,8 @@ public final class SpoutWorld extends SpoutAbstractWorld implements World {
 		spawnLocation.set(transform);
 	}
 
-	public EntityManager getEntityManager() {
-		return entityManager;
-	}
-
 	@Override
 	public void finalizeRun() throws InterruptedException {
-		entityManager.finalizeRun();
 		synchronized (columnSet) {
 			for (SpoutColumn c : columnSet) {
 				c.onFinalize();
@@ -401,7 +704,7 @@ public final class SpoutWorld extends SpoutAbstractWorld implements World {
 
 	@Override
 	public void preSnapshotRun() throws InterruptedException {
-		entityManager.preSnapshotRun();
+
 	}
 
 	@Override
@@ -410,8 +713,8 @@ public final class SpoutWorld extends SpoutAbstractWorld implements World {
 	}
 
 	@Override
-	public HashSet<Entity> getAll() {
-		HashSet<Entity> entities = new HashSet<Entity>(entityManager.getAll());
+	public List<Entity> getAll() {
+		ArrayList<Entity> entities = new ArrayList<Entity>();
 		for (Region region : regions) {
 			entities.addAll(region.getAll());
 		}
@@ -419,8 +722,8 @@ public final class SpoutWorld extends SpoutAbstractWorld implements World {
 	}
 
 	@Override
-	public HashSet<Entity> getAll(Class<? extends Controller> type) {
-		HashSet<Entity> entities = new HashSet<Entity>(entityManager.getAll(type));
+	public List<Entity> getAll(Class<? extends Controller> type) {
+		ArrayList<Entity> entities = new ArrayList<Entity>();
 		for (Region region : regions) {
 			entities.addAll(region.getAll(type));
 		}
@@ -429,15 +732,13 @@ public final class SpoutWorld extends SpoutAbstractWorld implements World {
 
 	@Override
 	public Entity getEntity(int id) {
-		Entity entity = entityManager.getEntity(id);
-		if (entity == null) {
-			for (Region region : regions) {
-				if ((entity = region.getEntity(id)) != null) {
-					break;
-				}
+		for (Region region : regions) {
+			Entity entity = region.getEntity(id);
+			if (entity != null) {
+				return entity;
 			}
 		}
-		return entity;
+		return null;
 	}
 
 	public void addPlayer(Player player) {
@@ -449,8 +750,132 @@ public final class SpoutWorld extends SpoutAbstractWorld implements World {
 	}
 
 	@Override
-	public Set<Player> getPlayers() {
-		return Collections.unmodifiableSet(players);
+	public List<Player> getPlayers() {
+		return Collections.unmodifiableList(players);
+	}
+
+	/**
+	 * Gets a set of nearby players to the point, inside of the range
+	 * @param position of the center
+	 * @param range to look for
+	 * @return A set of nearby Players
+	 */
+	@LiveRead
+	@Threadsafe
+	public List<Player> getNearbyPlayers(Point position, int range) {
+		return getNearbyPlayers(position, null, range);
+	}
+
+	/**
+	 * Gets a set of nearby players to the entity, inside of the range
+	 * @param entity marking the center and which is ignored
+	 * @param range to look for
+	 * @return A set of nearby Players
+	 */
+	@LiveRead
+	@Threadsafe
+	public List<Player> getNearbyPlayers(Entity entity, int range) {
+		return getNearbyPlayers(entity.getPosition(), entity, range);
+	}
+
+	/**
+	 * Gets a set of nearby players to the point, inside of the range.
+	 * The search will ignore the specified entity.
+	 * @param position of the center
+	 * @param ignore Entity to ignore
+	 * @param range to look for
+	 * @return A set of nearby Players
+	 */
+	@LiveRead
+	@Threadsafe
+	public List<Player> getNearbyPlayers(Point position, Entity ignore, int range) {
+		ArrayList<Player> foundPlayers = new ArrayList<Player>();
+		final int RANGE_SQUARED = range * range;
+
+		for (Player plr : getPlayersNearRegion(position, range)) {
+			if (plr != ignore && plr != null) {
+				double distance = MathHelper.distanceSquared(position, plr.getPosition());
+				if (distance < RANGE_SQUARED) {
+					foundPlayers.add(plr);
+				}
+			}
+		}
+
+		return foundPlayers;
+	}
+
+	/**
+	 * Finds all the players inside of the regions inside the range area
+	 * @param position to search from
+	 * @param range to search for regions
+	 * @return nearby region's players
+	 */
+	private List<Player> getPlayersNearRegion(Point position, int range) {
+		Region center = this.getRegionFromBlock(position, LoadOption.NO_LOAD);
+
+		ArrayList<Player> players = new ArrayList<Player>();
+		if (center != null) {
+			final int regions = (range + Region.BLOCKS.SIZE - 1) / Region.BLOCKS.SIZE; //round up 1 region size
+			for (int dx = -regions; dx < regions; dx++) {
+				for (int dy = -regions; dy < regions; dy++) {
+					for (int dz = -regions; dz < regions; dz++) {
+						Region region = this.getRegion(center.getX() + dx, center.getY() + dy, center.getZ() + dz, LoadOption.NO_LOAD);
+						if (region != null) {
+							players.addAll(region.getPlayers());
+						}
+					}
+				}
+			}
+		}
+		return players;
+	}
+
+	/**
+	 * Gets the absolute closest player from the specified point within a specified range.
+	 * @param position to search from
+	 * @param ignore to ignore while searching
+	 * @param range to search
+	 * @return nearest player
+	 */
+	@LiveRead
+	@Threadsafe
+	public Player getNearestPlayer(Point position, Entity ignore, int range) {
+		Player best = null;
+		double bestDistance = range * range;
+
+		for (Player plr : getPlayersNearRegion(position, range)) {
+			if (plr != ignore && plr != null) {
+				double distance = MathHelper.distanceSquared(position, plr.getPosition());
+				if (distance < bestDistance) {
+					bestDistance = distance;
+					best = plr;
+				}
+			}
+		}
+		return best;
+	}
+
+	/**
+	 * Gets the absolute closest player from the specified point within a specified range.
+	 * @param range to search
+	 * @return nearest player
+	 */
+	@LiveRead
+	@Threadsafe
+	public Player getNearestPlayer(Point position, int range) {
+		return getNearestPlayer(position, null, range);
+	}
+
+	/**
+	 * Gets the absolute closest player from the specified point within a specified range.
+	 * @param entity to search from
+	 * @param range to search
+	 * @return nearest player
+	 */
+	@LiveRead
+	@Threadsafe
+	public Player getNearestPlayer(Entity entity, int range) {
+		return getNearestPlayer(entity.getPosition(), entity, range);
 	}
 
 	public List<CollisionVolume> getCollidingObject(CollisionModel model) {
@@ -485,14 +910,13 @@ public final class SpoutWorld extends SpoutAbstractWorld implements World {
 
 	/**
 	 * Removes a column corresponding to the given Column coordinates
-	 *
 	 * @param x the x coordinate
 	 * @param z the z coordinate
 	 */
 	public void removeColumn(int x, int z, SpoutColumn column) {
 		long key = IntPairHashed.key(x, z);
 		if (columns.remove(key, column)) {
-			synchronized(columnSet) {
+			synchronized (columnSet) {
 				columnSet.remove(column);
 			}
 		}
@@ -500,7 +924,6 @@ public final class SpoutWorld extends SpoutAbstractWorld implements World {
 
 	/**
 	 * Gets the column corresponding to the given Block coordinates
-	 *
 	 * @param x the x block coordinate
 	 * @param z the z block coordinate
 	 * @param create true to create the column if it doesn't exist
@@ -516,7 +939,7 @@ public final class SpoutWorld extends SpoutAbstractWorld implements World {
 			column = columns.putIfAbsent(key, newColumn);
 			if (column == null) {
 				column = newColumn;
-				synchronized(columnSet) {
+				synchronized (columnSet) {
 					columnSet.add(column);
 				}
 			}
@@ -571,7 +994,7 @@ public final class SpoutWorld extends SpoutAbstractWorld implements World {
 	@Override
 	public Entity getEntity(UUID uid) {
 		for (Region region : regions) {
-			for (Entity e :region.getAll()) {
+			for (Entity e : region.getAll()) {
 				if (e.getUID().equals(uid)) {
 					return e;
 				}
@@ -603,10 +1026,10 @@ public final class SpoutWorld extends SpoutAbstractWorld implements World {
 		final int total = Math.max(1, regions.size());
 		int progress = 0;
 		for (Region r : regions) {
-			((SpoutRegion)r).unload(save);
+			((SpoutRegion) r).unload(save);
 			progress++;
 			if (save && progress % 4 == 0) {
-				Spout.getLogger().info("Saving world [" + getName() + "], " + (int)(progress * 100F / total) + "% Complete");
+				Spout.getLogger().info("Saving world [" + getName() + "], " + (int) (progress * 100F / total) + "% Complete");
 			}
 		}
 	}
@@ -675,13 +1098,9 @@ public final class SpoutWorld extends SpoutAbstractWorld implements World {
 		return dataMap;
 	}
 
-    @Override
-    public Serializable get(Object key) {
-        return dataMap.get(key);
-    }
-
-    public StringMap getItemMap() {
-		return itemMap;
+	@Override
+	public Serializable get(Object key) {
+		return dataMap.get(key);
 	}
 
 	@Override
@@ -712,7 +1131,7 @@ public final class SpoutWorld extends SpoutAbstractWorld implements World {
 			for (int dy = start.getY(); dy < end.getY(); dy++) {
 				for (int dz = start.getZ(); dz < end.getZ(); dz++) {
 					Chunk chunk = getChunk(dx, dy, dz);
-					((SpoutChunk)chunk).setCuboid(buffer);
+					((SpoutChunk) chunk).setCuboid(buffer);
 				}
 			}
 		}
@@ -724,6 +1143,10 @@ public final class SpoutWorld extends SpoutAbstractWorld implements World {
 	@Override
 	public void runPhysics(int sequence) throws InterruptedException {
 	}
+	
+	@Override
+	public void runLighting(int sequence) throws InterruptedException {
+	}
 
 	@Override
 	public long getFirstDynamicUpdateTime() {
@@ -733,7 +1156,7 @@ public final class SpoutWorld extends SpoutAbstractWorld implements World {
 	@Override
 	public void runDynamicUpdates(long time, int sequence) throws InterruptedException {
 	}
-	
+
 	public WeakReference<World> getWeakReference() {
 		return selfReference;
 	}

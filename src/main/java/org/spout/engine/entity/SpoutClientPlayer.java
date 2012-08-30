@@ -24,7 +24,7 @@
  * License and see <http://www.spout.org/SpoutDevLicenseV1.txt> for the full license,
  * including the MIT license.
  */
-package org.spout.engine.player;
+package org.spout.engine.entity;
 
 import org.spout.api.Spout;
 import org.spout.api.chat.ChatArguments;
@@ -54,7 +54,7 @@ public class SpoutClientPlayer extends SpoutPlayer {
 		if (session == null) {
 			return false;
 		}
-		session.getEngine().getConsole().addMessage(message);
+		session.getEngine().getConsoles().addMessage(message);
 		return true;
 	}
 

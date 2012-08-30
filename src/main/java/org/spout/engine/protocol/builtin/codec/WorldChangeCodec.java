@@ -24,39 +24,37 @@
  * License and see <http://www.spout.org/SpoutDevLicenseV1.txt> for the full license,
  * including the MIT license.
  */
-package org.spout.engine.chat.console;
+package org.spout.engine.protocol.builtin.codec;
 
-import java.io.Closeable;
-import java.text.DateFormat;
+import java.util.UUID;
 
-import org.spout.api.chat.ChatArguments;
+import org.jboss.netty.buffer.ChannelBuffer;
+import org.jboss.netty.buffer.ChannelBuffers;
+import org.spout.api.protocol.MessageCodec;
+import org.spout.api.protocol.builtin.ChannelBufferUtils;
+import org.spout.api.protocol.builtin.message.WorldChangeMessage;
 
-/**
- * A parent class for various types of consoles.
- */
-public interface Console extends Closeable {
-	/**
-	 * Initialize settings needed for this console.
-	 */
-	public void init();
+public class WorldChangeCodec extends MessageCodec<WorldChangeMessage> {
+	public WorldChangeCodec() {
+		super(WorldChangeMessage.class, 0x02);
+	}
 
-	/**
-	 * Clean up any resources used by the console
-	 */
-	public void close();
+	@Override
+	public ChannelBuffer encode(WorldChangeMessage message) {
+		ChannelBuffer buffer = ChannelBuffers.dynamicBuffer();
+		ChannelBufferUtils.writeString(buffer, message.getWorldName());
+		ChannelBufferUtils.writeUUID(buffer, message.getWorldUUID());
+		buffer.writeInt(message.getCompressedData().length);
+		buffer.writeBytes(message.getCompressedData());
+		return buffer;
+	}
 
-	/**
-	 * Set the date format to be used when printing the date of log messages.
-	 * If {@code format} is null, no date will be printed.
-	 *
-	 * @param format The log message date format.
-	 */
-	public void setDateFormat(DateFormat format);
-
-	/**
-	 * Add a message to the console
-	 *
-	 * @param message the message to add
-	 */
-	public void addMessage(ChatArguments message);
+	@Override
+	public WorldChangeMessage decode(ChannelBuffer buffer) {
+		final String worldName = ChannelBufferUtils.readString(buffer);
+		final UUID worldUUID = ChannelBufferUtils.readUUID(buffer);
+		final byte[] compressedData = new byte[buffer.readInt()];
+		buffer.readBytes(compressedData);
+		return new WorldChangeMessage(worldName, worldUUID, compressedData);
+	}
 }

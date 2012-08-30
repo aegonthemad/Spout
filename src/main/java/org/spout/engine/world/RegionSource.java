@@ -37,7 +37,6 @@ import org.spout.api.event.world.RegionUnloadEvent;
 import org.spout.api.geo.LoadOption;
 import org.spout.api.geo.cuboid.Region;
 import org.spout.api.scheduler.TaskManager;
-import org.spout.api.scheduler.TickStage;
 import org.spout.api.util.map.concurrent.TripleIntObjectMap;
 import org.spout.api.util.map.concurrent.TripleIntObjectReferenceArrayMap;
 import org.spout.api.util.thread.DelayedWrite;
@@ -58,9 +57,9 @@ public class RegionSource implements Iterable<Region> {
 	/**
 	 * World associated with this region source
 	 */
-	private final SpoutAbstractWorld world;
+	private final SpoutWorld world;
 
-	public RegionSource(SpoutAbstractWorld world, SnapshotManager snapshotManager) {
+	public RegionSource(SpoutWorld world, SnapshotManager snapshotManager) {
 		this.world = world;
 		loadedRegions = new TripleIntObjectReferenceArrayMap<Region>(REGION_MAP_BITS);
 	}
@@ -125,9 +124,6 @@ public class RegionSource implements Iterable<Region> {
 	 */
 	@LiveRead
 	public SpoutRegion getRegion(int x, int y, int z, LoadOption loadopt) {
-		// This is a pretty expensive place to perform a check
-		// It has to check if this is the region thread and then decide which mask to use
-		TickStage.checkStage(~TickStage.SNAPSHOT);
 		SpoutRegion region = (SpoutRegion) loadedRegions.get(x, y, z);
 
 		if (region != null) {

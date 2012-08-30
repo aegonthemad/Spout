@@ -26,11 +26,8 @@
  */
 package org.spout.engine.world;
 
-import java.io.DataInputStream;
 import java.io.DataOutputStream;
-import java.io.EOFException;
 import java.io.IOException;
-import java.io.InputStream;
 import java.io.OutputStream;
 import java.util.concurrent.atomic.AtomicBoolean;
 import java.util.concurrent.atomic.AtomicInteger;
@@ -42,11 +39,11 @@ import org.spout.api.geo.World;
 import org.spout.api.geo.cuboid.Chunk;
 import org.spout.api.material.BlockMaterial;
 import org.spout.api.material.Material;
-import org.spout.api.material.MaterialRegistry;
 import org.spout.api.material.block.BlockFaces;
 import org.spout.api.material.block.BlockFullState;
 import org.spout.api.math.BitSize;
 import org.spout.api.scheduler.TickStage;
+import org.spout.engine.filesystem.WorldFiles;
 
 public class SpoutColumn {
 	/**
@@ -58,7 +55,7 @@ public class SpoutColumn {
 	 */
 	public static BitSize BLOCKS = Chunk.BLOCKS;
 
-	private final World world;
+	private final SpoutWorld world;
 	private final int x;
 	private final int z;
 	private final AtomicInteger activeChunks = new AtomicInteger(0);
@@ -70,7 +67,7 @@ public class SpoutColumn {
 	private final BlockMaterial[][] topmostBlocks;
 	private final Thread worldThread;
 
-	public SpoutColumn(World world, int x, int z) {
+	public SpoutColumn(SpoutWorld world, int x, int z) {
 		this.world = world;
 		this.x = x;
 		this.z = z;
@@ -85,12 +82,12 @@ public class SpoutColumn {
 				dirtyArray[xx][zz] = new AtomicBoolean(false);
 			}
 		}
-		
+
 		lowestY.set(Integer.MAX_VALUE);
 
-		readHeightMap(((SpoutWorld) world).getHeightMapInputStream(x, z));
+		WorldFiles.readColumn(((SpoutWorld) world).getHeightMapInputStream(x, z), this, this.lowestY, topmostBlocks);
 	}
-	
+
 	public void onFinalize() {
 		TickStage.checkStage(TickStage.FINALIZE, worldThread);
 		if (dirty.compareAndSet(true, false)) {
@@ -105,7 +102,7 @@ public class SpoutColumn {
 						Chunk c = world.getChunkFromBlock(wxx, y, wzz, LoadOption.LOAD_ONLY);
 						BlockMaterial bm = null;
 						if (c != null) {
-							 bm = c.getBlockMaterial(wx + xx, y, wz + zz);	
+							 bm = c.getBlockMaterial(wx + xx, y, wz + zz);
 						}
 						topmostBlocks[xx][zz] = bm;
 					}
@@ -133,7 +130,7 @@ public class SpoutColumn {
 			if (activeChunks.decrementAndGet() == 0) {
 				OutputStream out = ((SpoutWorld) world).getHeightMapOutputStream(x, z);
 				try {
-					writeHeightMap(out);
+					WorldFiles.writeColumn(out, this, lowestY, topmostBlocks);
 				} finally {
 					try {
 						out.close();
@@ -159,9 +156,9 @@ public class SpoutColumn {
 		}
 
 		return getGeneratorHeight(x, z);
-		
+
 	}
-	
+
 	public BlockMaterial getTopmostBlock(int x, int z) {
 		TickStage.checkStage(TickStage.SNAPSHOT | TickStage.PRESNAPSHOT);
 		int cx = x & BLOCKS.MASK;
@@ -169,7 +166,7 @@ public class SpoutColumn {
 		BlockMaterial m = this.topmostBlocks[cx][cz];
 		return m;
 	}
-	
+
 	private int getGeneratorHeight(int x, int z) {
 		int[][] h = heights.get();
 		if (h == null) {
@@ -215,7 +212,19 @@ public class SpoutColumn {
 		//System.out.println("Notify block change:       " + x + ", " + y + ", " + z);
 		AtomicInteger v = getAtomicInteger(x, z);
 		notifyBlockChange(v, x, y, z);
-		//System.out.println("Notify block change ended: " + x + ", " + y + ", " + z);	
+		//System.out.println("Notify block change ended: " + x + ", " + y + ", " + z);
+	}
+
+	public int getX() {
+		return x;
+	}
+
+	public int getZ() {
+		return z;
+	}
+
+	public SpoutWorld getWorld() {
+		return world;
 	}
 
 	private void notifyBlockChange(AtomicInteger v, int x, int y, int z) {
@@ -270,106 +279,16 @@ public class SpoutColumn {
 		return material.isTransparent() && !material.getOcclusion(data).getAny(BlockFaces.BT);
 	}
 
-	private AtomicInteger getAtomicInteger(int x, int z) {
+	public AtomicInteger getAtomicInteger(int x, int z) {
 		return heightMap[x & BLOCKS.MASK][z & BLOCKS.MASK];
 	}
-	
+
 	private AtomicBoolean getDirtyFlag(int x, int z) {
 		return dirtyArray[x & BLOCKS.MASK][z & BLOCKS.MASK];
 	}
-	
-	private void setDirty(int x, int z) {
+
+	public void setDirty(int x, int z) {
 		getDirtyFlag(x, z).set(true);
 		dirty.set(true);
-	}
-
-	private void readHeightMap(InputStream in) {
-		if (in == null) {
-			//The inputstream is null because no height map data exists
-			for (int x = 0; x < BLOCKS.SIZE; x++) {
-				for (int z = 0; z < BLOCKS.SIZE; z++) {
-					getAtomicInteger(x, z).set(Integer.MIN_VALUE);
-					topmostBlocks[x][z] = null;
-					setDirty(x, z);
-				}
-			}
-			lowestY.set(Integer.MAX_VALUE);
-			return;
-		}
-
-		DataInputStream dataStream = new DataInputStream(in);
-		try {
-			for (int x = 0; x < BLOCKS.SIZE; x++) {
-				for (int z = 0; z < BLOCKS.SIZE; z++) {
-					getAtomicInteger(x, z).set(dataStream.readInt());
-				}
-			}
-			int version;
-			try {
-				version = dataStream.readInt();
-			} catch (EOFException eof) {
-				version = 1;
-			}
-			if (version > 1) {
-				lowestY.set(dataStream.readInt());
-			} else {
-				lowestY.set(Integer.MAX_VALUE);
-			}
-			if (version > 2) {
-				boolean warning = false;
-				for (int x = 0; x < BLOCKS.SIZE; x++) {
-					for (int z = 0; z < BLOCKS.SIZE; z++) {
-						if (!dataStream.readBoolean()) {
-							continue;
-						}
-						int blockState = dataStream.readInt();
-						BlockMaterial m;
-						try {
-							m = (BlockMaterial) MaterialRegistry.get(blockState);
-						} catch (ClassCastException e) {
-							m = null;
-							if (!warning) {
-								Spout.getLogger().severe("Error reading column topmost block information, block was not a valid BlockMaterial");
-								warning = false;
-							}
-						}
-						if (m == null) {
-							setDirty(x, z);
-						}
-						topmostBlocks[x][z] = m;
-					}
-				}
-			}
-		} catch (IOException e) {
-			Spout.getLogger().severe("Error reading column height-map for column" + x + ", " + z);
-		}
-	}
-
-	private void writeHeightMap(OutputStream out) {
-		DataOutputStream dataStream = new DataOutputStream(out);
-		try {
-			for (int x = 0; x < BLOCKS.SIZE; x++) {
-				for (int z = 0; z < BLOCKS.SIZE; z++) {
-					dataStream.writeInt(getAtomicInteger(x, z).get());
-				}
-			}
-			dataStream.writeInt(FILE_VERSION);
-			dataStream.writeInt(lowestY.get());
-			for (int x = 0; x < BLOCKS.SIZE; x++) {
-				for (int z = 0; z < BLOCKS.SIZE; z++) {
-					Material m = topmostBlocks[x][z];
-					if (m == null) {
-						dataStream.writeBoolean(false);
-						continue;
-					} else {
-						dataStream.writeBoolean(true);
-					}
-					dataStream.writeInt(BlockFullState.getPacked(m.getId(), m.getData()));
-				}
-			}
-			dataStream.flush();
-		} catch (IOException e) {
-			Spout.getLogger().severe("Error writing column height-map for column" + x + ", " + z);
-		}
 	}
 }

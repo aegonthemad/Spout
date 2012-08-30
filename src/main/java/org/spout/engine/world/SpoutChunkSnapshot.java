@@ -28,15 +28,15 @@ package org.spout.engine.world;
 
 import java.io.Serializable;
 import java.lang.ref.WeakReference;
+import java.util.ArrayList;
 import java.util.Collections;
-import java.util.HashSet;
-import java.util.Set;
-
+import java.util.List;
 import org.spout.api.datatable.DataMap;
 import org.spout.api.datatable.DatatableMap;
 import org.spout.api.datatable.GenericDatatableMap;
-import org.spout.api.entity.component.controller.BlockController;
 import org.spout.api.entity.Entity;
+import org.spout.api.entity.EntitySnapshot;
+import org.spout.api.entity.controller.BlockController;
 import org.spout.api.generator.biome.Biome;
 import org.spout.api.generator.biome.BiomeManager;
 import org.spout.api.geo.cuboid.Chunk;
@@ -46,6 +46,7 @@ import org.spout.api.map.DefaultedMap;
 import org.spout.api.material.BlockMaterial;
 import org.spout.api.material.block.BlockFullState;
 import org.spout.api.util.hashing.NibblePairHashed;
+
 import org.spout.engine.world.SpoutChunk.PopulationState;
 
 public class SpoutChunkSnapshot extends ChunkSnapshot {
@@ -53,10 +54,8 @@ public class SpoutChunkSnapshot extends ChunkSnapshot {
 	 * The parent region that manages this chunk
 	 */
 	private final WeakReference<Region> parentRegion;
-
 	private final byte worldSkyLightLoss;
-	private final Set<Entity> entities;
-	private final Set<WeakReference<Entity>> weakEntities;
+	private final List<EntitySnapshot> entities;
 	private final short[] blockIds;
 	private final short[] blockData;
 	private final byte[] blockLight;
@@ -67,22 +66,17 @@ public class SpoutChunkSnapshot extends ChunkSnapshot {
 	private boolean renderDirty = false;
 
 	public SpoutChunkSnapshot(SpoutChunk chunk, short[] blockIds, short[] blockData, byte[] blockLight, byte[] skyLight, EntityType type, ExtraData data) {
-		super(chunk.getWorld(), chunk.getX() * CHUNK_SIZE, chunk.getY()  * CHUNK_SIZE, chunk.getZ()  * CHUNK_SIZE);
+		super(chunk.getWorld(), chunk.getX() * CHUNK_SIZE, chunk.getY() * CHUNK_SIZE, chunk.getZ() * CHUNK_SIZE);
 		parentRegion = new WeakReference<Region>(chunk.getRegion());
 
 		// Cache entities
-		if (type == EntityType.WEAK_ENTITIES) {
-			Set<WeakReference<Entity>> liveEntities = new HashSet<WeakReference<Entity>>();
+		if (type == EntityType.ENTITIES) {
+			ArrayList<EntitySnapshot> entities = new ArrayList<EntitySnapshot>();
 			for (Entity e : chunk.getLiveEntities()) {
-				liveEntities.add(new WeakReference<Entity>(e));
+				entities.add(new EntitySnapshot(e));
 			}
-			this.weakEntities = Collections.unmodifiableSet(liveEntities);
-			this.entities = null;
-		} else if (type == EntityType.ENTITIES) {
-			this.weakEntities = null;
-			this.entities = Collections.unmodifiableSet(new HashSet<Entity>(chunk.getLiveEntities()));
+			this.entities = Collections.unmodifiableList(entities);
 		} else {
-			this.weakEntities = null;
 			this.entities = null;
 		}
 		this.worldSkyLightLoss = (byte) (15 - chunk.getWorld().getSkyLight());
@@ -193,18 +187,9 @@ public class SpoutChunkSnapshot extends ChunkSnapshot {
 	}
 
 	@Override
-	public Set<Entity> getEntities() {
-		if (this.entities == null && this.weakEntities == null) {
-			throw new UnsupportedOperationException("This chunk snapshot does not contain block data");
-		} else if (this.weakEntities != null) {
-			Set<Entity> entities = new HashSet<Entity>();
-			for (WeakReference<Entity> ref : this.weakEntities) {
-				Entity e = ref.get();
-				if (e != null) {
-					entities.add(e);
-				}
-			}
-			return entities;
+	public List<EntitySnapshot> getEntities() {
+		if (this.entities == null) {
+			throw new UnsupportedOperationException("This chunk snapshot does not contain entities");
 		} else {
 			return this.entities;
 		}
@@ -252,7 +237,7 @@ public class SpoutChunkSnapshot extends ChunkSnapshot {
 	public boolean isPopulated() {
 		return populationState == PopulationState.POPULATED;
 	}
-	
+
 	public PopulationState getPopulationState() {
 		return populationState;
 	}

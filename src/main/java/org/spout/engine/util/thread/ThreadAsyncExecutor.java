@@ -35,6 +35,7 @@ import org.spout.engine.scheduler.SpoutScheduler;
 import org.spout.engine.util.thread.coretasks.CopySnapshotTask;
 import org.spout.engine.util.thread.coretasks.DynamicUpdatesTask;
 import org.spout.engine.util.thread.coretasks.FinalizeTask;
+import org.spout.engine.util.thread.coretasks.LightingTask;
 import org.spout.engine.util.thread.coretasks.PhysicsTask;
 import org.spout.engine.util.thread.coretasks.PreSnapshotTask;
 import org.spout.engine.util.thread.coretasks.StartTickTask;
@@ -43,22 +44,29 @@ import org.spout.engine.util.thread.coretasks.StartTickTask;
  * This is a thread that executes tasks
  */
 public final class ThreadAsyncExecutor extends PulsableThread implements AsyncExecutor {
-	private ConcurrentLinkedQueue<ManagementRunnable> taskQueue = new ConcurrentLinkedQueue<ManagementRunnable>();
-	private CopySnapshotTask copySnapshotTask = new CopySnapshotTask();
-	private StartTickTask startTickTask = new StartTickTask();
-	private DynamicUpdatesTask dynamicUpdatesTask = new DynamicUpdatesTask();
-	private PhysicsTask physicsTask = new PhysicsTask();
-	private PreSnapshotTask preSnapshotTask = new PreSnapshotTask();
-	private FinalizeTask finalizeTask = new FinalizeTask();
+	private final ConcurrentLinkedQueue<ManagementRunnable> taskQueue = new ConcurrentLinkedQueue<ManagementRunnable>();
+	private final CopySnapshotTask copySnapshotTask = new CopySnapshotTask();
+	private final StartTickTask startTickTask = new StartTickTask();
+	private final DynamicUpdatesTask dynamicUpdatesTask = new DynamicUpdatesTask();
+	private final PhysicsTask physicsTask = new PhysicsTask();
+	private final LightingTask lightingTask = new LightingTask();
+	private final PreSnapshotTask preSnapshotTask = new PreSnapshotTask();
+	private final FinalizeTask finalizeTask = new FinalizeTask();
 	private AsyncManager manager = null;
-	private AtomicReference<ExecutorState> state = new AtomicReference<ExecutorState>(ExecutorState.CREATED);
-	private AtomicInteger wakeCounter = new AtomicInteger(0);
+	private final AtomicReference<ExecutorState> state = new AtomicReference<ExecutorState>(ExecutorState.CREATED);
+	private final AtomicInteger wakeCounter = new AtomicInteger(0);
+	private final int sequence;
 	private static final int wakePulsing = 1;
 	private static final int wakePending = 2;
 	private static final int wakeDelta = 4;
 
 	public ThreadAsyncExecutor(String name) {
+		this(name, Integer.MIN_VALUE);
+	}
+	
+	public ThreadAsyncExecutor(String name, int sequence) {
 		super(name);
+		this.sequence = sequence;
 	}
 
 	@Override
@@ -154,10 +162,14 @@ public final class ThreadAsyncExecutor extends PulsableThread implements AsyncEx
 	
 	@Override
 	public final boolean doPhysics(int sequence) {
-		ThreadsafetyManager.checkMainThread();
-		physicsTask.setSequence(sequence);
-		taskQueue.add(physicsTask);
-		return pulse();
+		if (sequence == -1 || sequence == this.sequence) {
+			ThreadsafetyManager.checkMainThread();
+			physicsTask.setSequence(sequence);
+			taskQueue.add(physicsTask);
+			return pulse();
+		} else {
+			return true;
+		}
 	}
 	
 	@Override
@@ -167,6 +179,18 @@ public final class ThreadAsyncExecutor extends PulsableThread implements AsyncEx
 			dynamicUpdatesTask.setTime(time);
 			dynamicUpdatesTask.setSequence(sequence);
 			taskQueue.add(dynamicUpdatesTask);
+			return pulse();
+		} else {
+			return true;
+		}
+	}
+	
+	@Override
+	public final boolean doLighting(int sequence) {
+		if (sequence == -1 || sequence == this.sequence) {
+			ThreadsafetyManager.checkMainThread();
+			lightingTask.setSequence(sequence);
+			taskQueue.add(lightingTask);
 			return pulse();
 		} else {
 			return true;

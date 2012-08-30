@@ -26,41 +26,36 @@
  */
 package org.spout.engine.entity;
 
+import java.util.ArrayList;
 import java.util.Collection;
 import java.util.Collections;
 import java.util.HashMap;
-import java.util.HashSet;
-import java.util.Iterator;
+import java.util.List;
 import java.util.Map;
-import java.util.Set;
 import java.util.concurrent.ConcurrentHashMap;
 import java.util.concurrent.atomic.AtomicInteger;
 
-import org.spout.api.Spout;
-import org.spout.api.datatable.GenericDatatableMap;
+import org.spout.api.entity.Controller;
 import org.spout.api.entity.Entity;
-import org.spout.api.entity.component.Controller;
-import org.spout.api.entity.component.controller.BlockController;
-import org.spout.api.entity.component.controller.PlayerController;
-import org.spout.api.event.entity.EntityDespawnEvent;
-import org.spout.api.event.entity.EntitySpawnEvent;
+import org.spout.api.entity.Player;
+import org.spout.api.entity.controller.BlockController;
+import org.spout.api.math.MathHelper;
 import org.spout.api.math.Vector3;
-import org.spout.api.player.Player;
-import org.spout.api.util.StringMap;
+import org.spout.api.protocol.NetworkSynchronizer;
 
 import org.spout.engine.util.thread.snapshotable.SnapshotManager;
+import org.spout.engine.util.thread.snapshotable.SnapshotableArrayList;
 import org.spout.engine.util.thread.snapshotable.SnapshotableHashMap;
-import org.spout.engine.util.thread.snapshotable.SnapshotableHashSet;
 import org.spout.engine.world.SpoutRegion;
 
 /**
  * A class which manages all of the entities within a world.
  */
-public class EntityManager implements Iterable<SpoutEntity> {
+public class EntityManager {
 	/**
 	 * The snapshot manager
 	 */
-	private final SnapshotManager snapshotManager = new SnapshotManager();
+	protected final SnapshotManager snapshotManager = new SnapshotManager();
 	/**
 	 * A map of all the entity ids to the corresponding entities.
 	 */
@@ -68,37 +63,31 @@ public class EntityManager implements Iterable<SpoutEntity> {
 	/**
 	 * A map of entity types to a set containing all entities of that type.
 	 */
-	private final ConcurrentHashMap<Class<? extends Controller>, SnapshotableHashSet<SpoutEntity>> groupedEntities = new ConcurrentHashMap<Class<? extends Controller>, SnapshotableHashSet<SpoutEntity>>();
-
-	private final SnapshotableHashSet<PlayerController> players = new SnapshotableHashSet<PlayerController>(snapshotManager);
+	private final ConcurrentHashMap<Class<? extends Controller>, SnapshotableArrayList<SpoutEntity>> groupedEntities = new ConcurrentHashMap<Class<? extends Controller>, SnapshotableArrayList<SpoutEntity>>();
 	/**
 	 * The next id to check.
 	 */
 	private final static AtomicInteger nextId = new AtomicInteger(1);
-	private final StringMap entityMap = GenericDatatableMap.getStringMap();
-
-	private final Map<Vector3, Entity> blockEntities = new HashMap<Vector3, Entity>();
-
-	private SnapshotableHashSet<SpoutEntity> getRawAll(Class<? extends Controller> type) {
-		SnapshotableHashSet<SpoutEntity> set = groupedEntities.get(type);
-		if (set == null) {
-			set = new SnapshotableHashSet<SpoutEntity>(snapshotManager);
-			SnapshotableHashSet<SpoutEntity> currentSet = groupedEntities.putIfAbsent(type, set);
-			if (currentSet != null) {
-				set = currentSet;
-			}
-		}
-		return set;
-	}
 
 	/**
-	 * Gets all entities with the specified type from the live map.
-	 *
-	 * @param type The {@link Class} for the type.
-	 * @return A set of entities with the specified type.
+	 * The map of entities to Vector3s(BlockControllers)
 	 */
-	public Set<SpoutEntity> getLiveAll(Class<? extends Controller> type) {
-		return getRawAll(type).getLive();
+	private final Map<Vector3, Entity> blockEntities = new HashMap<Vector3, Entity>();
+	
+	/**
+	 * The region with entities this manager manages.
+	 */
+	private final SpoutRegion region;
+	/**
+	 * Player listings plus listings of sync'd entities per player
+	 */
+	private final SnapshotableHashMap<Player, List<SpoutEntity>> players = new SnapshotableHashMap<Player, List<SpoutEntity>>(snapshotManager);
+
+	public EntityManager(SpoutRegion region) {
+		if (region == null) {
+			throw new NullPointerException("Region can not be null!");
+		}
+		this.region = region;
 	}
 
 	/**
@@ -107,24 +96,59 @@ public class EntityManager implements Iterable<SpoutEntity> {
 	 * @param type The {@link Class} for the type.
 	 * @return A set of entities with the specified type.
 	 */
-	public Set<SpoutEntity> getAll(Class<? extends Controller> type) {
-		return getRawAll(type).get();
+	public List<SpoutEntity> getAll(Class<? extends Controller> type) {
+		SnapshotableArrayList<SpoutEntity> entities = groupedEntities.get(type);
+		if (entities == null) {
+			return Collections.emptyList();
+		}
+		return Collections.unmodifiableList(entities.get());
 	}
 
 	/**
-	 * Gets all entities.
+	 * Gets all entities from the snapshot.
 	 *
-	 * @return A set of entities.
+	 * @return A collection of entities.
 	 */
-	public Set<SpoutEntity> getAll() {
-		Collection<SpoutEntity> collection = entities.get().values();
-		HashSet<SpoutEntity> set = new HashSet<SpoutEntity>(collection.size());
-		for (SpoutEntity entity : collection) {
-			set.add(entity);
+	public Collection<SpoutEntity> getAll() {
+		Collection<SpoutEntity> all = entities.get().values();
+		if (all == null) {
+			return Collections.emptyList();
 		}
-		return set;
+		return all;
+	}
+	
+	/**
+	 * Gets all the entities that are in a live state (not the snapshot).
+	 * @return A collection of entities 
+	 */
+	public Collection<SpoutEntity> getAllLive() {
+		Collection<SpoutEntity> all = entities.getLive().values();
+		if (all == null) {
+			return Collections.emptyList();
+		}
+		return all;
 	}
 
+	/**
+	 * Gets all the players currently in the engine.
+	 * @return The list of players.
+	 */
+	public List<Player> getPlayers() {
+		Map<?, ?> map = players.get();
+		if (map == null) {
+			return Collections.emptyList();
+		}
+		return Collections.unmodifiableList(new ArrayList<Player>(players.get().keySet()));
+	}
+	
+	/**
+	 * Gets the map of all entities at a vector 3. This is for BlockControllers
+	 * @return The map containing entities at a vector 3
+	 */
+	public Map<Vector3, Entity> getBlockEntities() {
+		return Collections.unmodifiableMap(blockEntities);
+	}
+	
 	/**
 	 * Gets an entity by its id.
 	 *
@@ -134,7 +158,19 @@ public class EntityManager implements Iterable<SpoutEntity> {
 	public SpoutEntity getEntity(int id) {
 		return entities.get().get(id);
 	}
-
+	
+	/**
+	 * Determines if the entity is spawnable.
+	 * @param entity The entity
+	 * @return True if spawnable, false if not
+	 */
+	public boolean isSpawnable(SpoutEntity entity) {
+		if (entity.getId() == SpoutEntity.NOTSPAWNEDID) {
+			return true;
+		}
+		return false;
+	}
+	
 	/**
 	 * Allocates the id for an entity.
 	 *
@@ -142,21 +178,6 @@ public class EntityManager implements Iterable<SpoutEntity> {
 	 * @return The id.
 	 */
 	public int allocate(SpoutEntity entity) {
-		return allocate(entity, null);
-	}
-
-	/**
-	 * Allocates the id for an entity.
-	 *
-	 * @param entity The entity.
-	 * @return The id.
-	 */
-	public int allocate(SpoutEntity entity, SpoutRegion region) {
-		EntitySpawnEvent event = new EntitySpawnEvent(entity, entity.getPosition());
-		Spout.getEngine().getEventManager().callEvent(event);
-		if (event.isCancelled()) {
-			return -1; //TODO correct?
-		}
 		int currentId = entity.getId();
 		if (currentId == SpoutEntity.NOTSPAWNEDID) {
 			currentId = nextId.getAndIncrement();
@@ -172,30 +193,30 @@ public class EntityManager implements Iterable<SpoutEntity> {
 
 	/**
 	 * Deallocates the id for an entity.
-	 *
 	 * @param entity The entity.
 	 */
 	public void deallocate(SpoutEntity entity) {
-		EntityDespawnEvent event = new EntityDespawnEvent(entity);
-		Spout.getEngine().getEventManager().callEvent(event);
-		if (event.isCancelled()) {
-			return;
-		}
 		entities.remove(entity.getId());
+
 		//Players are never removed (offline concept), instead set their ID back to -1 to be reallocated.
 		if (entity instanceof Player) {
 			entity.setId(SpoutEntity.NOTSPAWNEDID);
 		}
 	}
-
-	public void addEntity(SpoutEntity entity, SpoutRegion region) {
-		allocate(entity, region);
-		if (entity.getController() != null) {
-			getRawAll(entity.getController().getClass()).add(entity);
-			Controller c = entity.getController();
-			if (c instanceof PlayerController) {
-				players.add((PlayerController) c);
-			} else if (c instanceof BlockController) {
+	
+	/**
+	 * Adds an entity to the manager.
+	 * @param entity The entity
+	 */
+	public void addEntity(SpoutEntity entity) {
+		allocate(entity);
+		Controller c = entity.getController();
+		if (c != null) {
+			if (entity instanceof Player) {
+				players.putIfAbsent((Player) entity, new ArrayList<SpoutEntity>());
+				return;
+			}
+			if (c instanceof BlockController) {
 				Vector3 pos = entity.getPosition().floor();
 				Entity old = blockEntities.put(pos, entity);
 				if (old != null) {
@@ -204,15 +225,20 @@ public class EntityManager implements Iterable<SpoutEntity> {
 			}
 		}
 	}
-
+	
+	/**
+	 * Removes an entity from the manager.
+	 * @param entity The entity
+	 */
 	public void removeEntity(SpoutEntity entity) {
 		deallocate(entity);
-		Controller controller = entity.getController();
-		if (controller != null) {
-			getRawAll(entity.getController().getClass()).remove(entity);
-			if (controller instanceof PlayerController) {
-				players.remove((PlayerController)controller);
-			} else if (controller instanceof BlockController) {
+		if (entity instanceof Player) {
+			players.remove((Player) entity);
+			return;
+		}		
+		Controller c = entity.getController();
+		if (c != null) {
+			if (c instanceof BlockController) {
 				Vector3 pos = entity.getPosition().floor();
 				Entity be = blockEntities.get(pos);
 				if (be == entity) {
@@ -223,22 +249,14 @@ public class EntityManager implements Iterable<SpoutEntity> {
 	}
 
 	/**
-	 * Gets all of the player controllers managed this entity manager
-	 *
-	 * @return players managed by this entity manager
+	 * Finalizes the manager at the FINALIZERUN tick stage
 	 */
-	public Set<PlayerController> getPlayers() {
-		return players.get();
-	}
-
-	@Override
-	public Iterator<SpoutEntity> iterator() {
-		return entities.get().values().iterator();
-	}
-
 	public void finalizeRun() {
-		// Entity removal and additions happen here
 		for (SpoutEntity e : entities.get().values()) {
+			if (e.isDead()) {
+				removeEntity(e);
+				continue;
+			}
 			e.finalizeRun();
 			Controller controller = e.getController();
 			if (controller == null) {
@@ -247,24 +265,23 @@ public class EntityManager implements Iterable<SpoutEntity> {
 
 			controller.finalizeTick();
 
-			if (!(controller instanceof PlayerController)) {
-				continue;
-			}
-
-			Player p = ((PlayerController) controller).getParent();
-			if (p.isOnline()) {
-				p.getNetworkSynchronizer().finalizeTick();
+			if (e instanceof Player) {
+				Player p = (Player) e;
+				if (p.isOnline()) {
+					p.getNetworkSynchronizer().finalizeTick();
+				}
 			}
 		}
 	}
 
+	/**
+	 * Prepares the manager for a snapshot in the PRESNAPSHOT tickstage
+	 */
 	public void preSnapshotRun() {
 		for (SpoutEntity e : entities.get().values()) {
-			Controller controller = e.getController();
-			if (controller != null) {
-				controller.preSnapshot();
-				if (controller instanceof PlayerController) {
-					Player p = ((PlayerController) controller).getParent();
+			if (e.getController() != null) {
+				if (e instanceof Player) {
+					Player p = (Player) e;
 					if (p.isOnline()) {
 						p.getNetworkSynchronizer().preSnapshot();
 					}
@@ -272,35 +289,68 @@ public class EntityManager implements Iterable<SpoutEntity> {
 			}
 		}
 	}
-
+	
 	/**
-	 * Updates the snapshot for all entities
+	 * Snapshots the manager and all the entities managed in the SNAPSHOT tickstage.
 	 */
 	public void copyAllSnapshots() {
 		for (SpoutEntity e : entities.get().values()) {
-			e.copyToSnapshot();
+			e.copySnapshot();
 		}
 		snapshotManager.copyAllSnapshots();
 	}
 
 	/**
-	 * Gets the string map associated with this entity manager
-	 * @return
+	 * The region this entity manager oversees
+	 *
+	 * @return region
 	 */
-	public StringMap getStringMap() {
-		return entityMap;
+	public SpoutRegion getRegion() {
+		return region;
 	}
 
 	/**
-	 * The region this entity manager oversees, or null if it does not manage a region's entities
-	 *
-	 * @return region or null
+	 * Syncs all entities/observers in this region
 	 */
-	public SpoutRegion getRegion() {
-		return null;
-	}
-
-	public Map<Vector3, Entity> getBlockEntities() {
-		return Collections.unmodifiableMap(blockEntities);
+	public void syncEntities() {
+		Map<Player, List<SpoutEntity>> toSync = players.get();
+		for (Player player : toSync.keySet()) {
+			/*
+			 * Offline players have no network synchronizer, skip them
+			 */
+			if (!player.isOnline()) {
+				continue;
+			}
+			Integer playerViewDistance = player.getViewDistance();
+			NetworkSynchronizer net = player.getNetworkSynchronizer();
+			List<SpoutEntity> entitiesPerPlayer = toSync.get(player);
+			if (entitiesPerPlayer == null) {
+				entitiesPerPlayer = new ArrayList<SpoutEntity>();
+			}
+			boolean spawn, destroy, update;
+			for (SpoutEntity entity : getAll()) {
+				if (entity.equals(player)) {
+					continue;
+				}
+				boolean contains = entitiesPerPlayer.contains(entity);
+				spawn = destroy = update = false;
+				if (MathHelper.distance(player.getPosition(), entity.getPosition()) <= playerViewDistance) {
+					if (!contains) {
+						entitiesPerPlayer.add(entity);
+						spawn = true; // Spawn
+					} else if (entity.isDead()) {
+						destroy = entitiesPerPlayer.remove(entity); // Destroy if not already destroyed
+					} else if (!entity.getController().equals(entity.getPrevController())) {
+						destroy = spawn = true; // Re-spawn
+					} else {
+						update = true; // Update otherwise
+					}
+				} else {
+					destroy = entitiesPerPlayer.remove(entity); // Destroy if not already destroyed
+				}
+				net.syncEntity(entity, spawn, destroy, update);
+			}
+			players.put(player, entitiesPerPlayer);
+		}
 	}
 }

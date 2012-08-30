@@ -27,11 +27,10 @@
 package org.spout.engine.world.physics;
 
 import java.util.concurrent.ConcurrentLinkedQueue;
+import java.util.concurrent.atomic.AtomicBoolean;
 
 import org.spout.api.Source;
 import org.spout.api.Spout;
-import org.spout.api.exception.IllegalTickSequenceException;
-import org.spout.api.geo.LoadOption;
 import org.spout.api.geo.cuboid.Chunk;
 import org.spout.api.geo.cuboid.Region;
 import org.spout.api.material.BlockMaterial;
@@ -40,6 +39,7 @@ import org.spout.api.material.range.EffectRange;
 import org.spout.api.math.IntVector3;
 import org.spout.api.scheduler.TickStage;
 import org.spout.engine.scheduler.SpoutScheduler;
+import org.spout.engine.world.SpoutChunk;
 import org.spout.engine.world.SpoutRegion;
 
 public class PhysicsQueue {
@@ -47,16 +47,22 @@ public class PhysicsQueue {
 	private final static int localStages = TickStage.DYNAMIC_BLOCKS | TickStage.PHYSICS;
 	private final static int globalStages = TickStage.GLOBAL_DYNAMIC_BLOCKS | TickStage.GLOBAL_PHYSICS;
 	
+	private final static int MASK = ~Chunk.BLOCKS.MASK;
+	
 	private final SpoutRegion region;
+	private final SpoutChunk chunk;
 	private final Thread regionThread;
 	private final Thread mainThread;
+	private final AtomicBoolean localActive = new AtomicBoolean(false);
+	private final AtomicBoolean globalActive = new AtomicBoolean(false);
 	
 	private final ConcurrentLinkedQueue<PhysicsUpdate> asyncQueue = new ConcurrentLinkedQueue<PhysicsUpdate>();
 	private final UpdateQueue updateQueue = new UpdateQueue();
 	private final UpdateQueue multiRegionQueue = new UpdateQueue();
 	
-	public PhysicsQueue(SpoutRegion region) {
-		this.region = region;
+	public PhysicsQueue(SpoutChunk chunk) {
+		this.region = chunk.getRegion();
+		this.chunk = chunk;
 		this.regionThread = region.getExceutionThread();
 		this.mainThread = ((SpoutScheduler)Spout.getScheduler()).getMainThread();
 	}
@@ -76,8 +82,10 @@ public class PhysicsQueue {
 				int ox = x + v.getX();
 				int oy = y + v.getY();
 				int oz = z + v.getZ();
-				if (ox >= 0 && ox < Region.BLOCKS.SIZE && oy >= 0 && oy < Region.BLOCKS.SIZE && oz >= 0 && oz < Region.BLOCKS.SIZE) {
+				if ((ox & MASK) == (x & MASK) && (oy & MASK) == (y & MASK) && (oz & MASK) == (z & MASK)) {
 					queueForUpdate(ox, oy, oz, update.getOldMaterial(), update.getSource());
+				} else if (ox >= 0 && ox < Region.BLOCKS.SIZE && oy >= 0 && oy < Region.BLOCKS.SIZE && oz >= 0 && oz < Region.BLOCKS.SIZE) {
+					region.updateBlockPhysics(ox, oy, oz, update.getOldMaterial(), update.getSource());
 				} else {
 					region.getWorld().queueBlockPhysics(region.getBlockX() + ox, region.getBlockY() + oy, region.getBlockZ() + oz, EffectRange.THIS, update.getOldMaterial(), update.getSource());
 				}
@@ -88,16 +96,36 @@ public class PhysicsQueue {
 	
 	public void queueForUpdateAsync(int x, int y, int z, EffectRange range, BlockMaterial oldMaterial, Source source) {
 		asyncQueue.add(new PhysicsUpdate(x, y, z, range, oldMaterial, source));
+		registerActive();
 	}
 	
 	public void queueForUpdate(int x, int y, int z, BlockMaterial oldMaterial, Source source) {
 		checkStages();
 		updateQueue.add(x, y, z, oldMaterial, source);
+		registerActive();
 	}
 	
 	public void queueForUpdateMultiRegion(int x, int y, int z, BlockMaterial oldMaterial, Source source) {
 		checkStages();
 		multiRegionQueue.add(x, y, z, oldMaterial, source);
+		registerActive();
+	}
+	
+	public void setInactive(boolean local) {
+		if (local) {
+			localActive.set(false);
+		} else {
+			globalActive.set(false);
+		}
+	}
+	
+	public void registerActive() {
+		if (localActive.compareAndSet(false, true)) {
+			region.setPhysicsActive(chunk, true);
+		}
+		if (globalActive.compareAndSet(false, true)) {
+			region.setPhysicsActive(chunk, false);
+		}
 	}
 	
 	public UpdateQueue getUpdateQueue() {

@@ -28,8 +28,8 @@ package org.spout.engine.listener;
 
 import java.net.InetAddress;
 
-import org.spout.api.Spout;
 import org.spout.api.chat.style.ChatStyle;
+import org.spout.api.entity.Player;
 import org.spout.api.event.EventHandler;
 import org.spout.api.event.Listener;
 import org.spout.api.event.Order;
@@ -41,9 +41,9 @@ import org.spout.api.event.player.PlayerLoginEvent;
 import org.spout.api.event.server.BanChangeEvent.BanType;
 import org.spout.api.event.server.permissions.PermissionGetAllWithNodeEvent;
 import org.spout.api.event.storage.PlayerLoadEvent;
-import org.spout.api.player.Player;
 
 import org.spout.engine.SpoutServer;
+import org.spout.engine.entity.SpoutPlayer;
 import org.spout.engine.protocol.SpoutSession;
 
 public class SpoutServerListener implements Listener {
@@ -59,12 +59,12 @@ public class SpoutServerListener implements Listener {
 			return;
 		}
 		//Create the player
-		final Player player = server.addPlayer(event.getPlayerName(), (SpoutSession<?>) event.getSession(), event.getViewDistance());
+		final SpoutPlayer player = (SpoutPlayer) server.addPlayer(event.getPlayerName(), (SpoutSession<?>) event.getSession(), event.getViewDistance());
 
 		if (player != null) {
-			Spout.getEngine().getEventManager().callEvent(new PlayerLoadEvent(player));
+			server.getEventManager().callEvent(new PlayerLoadEvent(player));
 			event.getSession().getProtocol().initializeSession(event.getSession());
-			PlayerLoginEvent loginEvent = Spout.getEngine().getEventManager().callEvent(new PlayerLoginEvent(player));
+			PlayerLoginEvent loginEvent = server.getEventManager().callEvent(new PlayerLoginEvent(player));
 			if (!loginEvent.isAllowed()) {
 				if (loginEvent.getMessage() != null) {
 					player.kick(loginEvent.getMessage());
@@ -72,7 +72,7 @@ public class SpoutServerListener implements Listener {
 					player.kick();
 				}
 			} else {
-				Spout.getEngine().getEventManager().callEvent(new PlayerJoinEvent(player, ChatStyle.CYAN, player.getDisplayName(), ChatStyle.CYAN, " has joined the game"));
+				server.getEventManager().callEvent(new PlayerJoinEvent(player, ChatStyle.CYAN, player.getDisplayName(), ChatStyle.CYAN, " has joined the game"));
 			}
 		} else {
 			event.getSession().disconnect("Player is already online");
@@ -86,14 +86,14 @@ public class SpoutServerListener implements Listener {
 		InetAddress address = p.getAddress();
 		if (address == null) {
 			event.disallow("Invalid IP Address!");
-		} else if (server.isPlayerBanned(p.getName())) {
-			banEvent = server.getEventManager().callEvent(new PlayerBanKickEvent(p, BanType.PLAYER, server.getBanMessage(p.getName())));
-		} else if (server.isIPBanned(address.getHostAddress())) {
-			banEvent = server.getEventManager().callEvent(new PlayerBanKickEvent(p, BanType.IP, server.getIPBanMessage(p.getAddress().getHostAddress())));
+		} else if (server.isBanned(p.getName())) {
+			banEvent = server.getEventManager().callEvent(new PlayerBanKickEvent(p, BanType.PLAYER, server.getBanMessage()));
+		} else if (server.isIpBanned(address.getHostAddress())) {
+			banEvent = server.getEventManager().callEvent(new PlayerBanKickEvent(p, BanType.IP, server.getIpBanMessage()));
 		}
 
 		if (banEvent != null && !banEvent.isCancelled()) {
-			event.disallow(!banEvent.getMessage().equals("") ? banEvent.getMessage() : (banEvent.getBanType() == BanType.PLAYER) ? server.getBanMessage(p.getName()) : server.getIPBanMessage(p.getAddress().getHostAddress()));
+			event.disallow(!banEvent.getMessage().getPlainString().equals("") ? banEvent.getMessage() : (banEvent.getBanType() == BanType.PLAYER) ? server.getBanMessage() : server.getIpBanMessage());
 			return;
 		}
 

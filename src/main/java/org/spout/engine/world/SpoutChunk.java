@@ -30,10 +30,11 @@ import java.io.Serializable;
 import java.lang.ref.WeakReference;
 import java.util.ArrayList;
 import java.util.Arrays;
+import java.util.Collections;
 import java.util.List;
-import java.util.Map;
 import java.util.Random;
 import java.util.Set;
+import java.util.concurrent.ConcurrentHashMap;
 import java.util.concurrent.Future;
 import java.util.concurrent.atomic.AtomicBoolean;
 import java.util.concurrent.atomic.AtomicInteger;
@@ -47,8 +48,7 @@ import org.spout.api.datatable.DataMap;
 import org.spout.api.datatable.DatatableMap;
 import org.spout.api.datatable.GenericDatatableMap;
 import org.spout.api.entity.Entity;
-import org.spout.api.entity.component.controller.BlockController;
-import org.spout.api.entity.component.controller.PlayerController;
+import org.spout.api.entity.controller.BlockController;
 import org.spout.api.event.block.BlockChangeEvent;
 import org.spout.api.generator.Populator;
 import org.spout.api.generator.WorldGeneratorUtils;
@@ -56,6 +56,7 @@ import org.spout.api.generator.biome.Biome;
 import org.spout.api.generator.biome.BiomeManager;
 import org.spout.api.geo.AreaBlockSource;
 import org.spout.api.geo.LoadOption;
+import org.spout.api.geo.World;
 import org.spout.api.geo.cuboid.Block;
 import org.spout.api.geo.cuboid.Chunk;
 import org.spout.api.geo.cuboid.ChunkSnapshot;
@@ -75,37 +76,34 @@ import org.spout.api.material.block.BlockSnapshot;
 import org.spout.api.material.range.EffectRange;
 import org.spout.api.math.MathHelper;
 import org.spout.api.math.Vector3;
-import org.spout.api.player.Player;
-import org.spout.api.protocol.NetworkSynchronizer;
 import org.spout.api.scheduler.TickStage;
 import org.spout.api.util.cuboid.CuboidBuffer;
 import org.spout.api.util.hashing.NibblePairHashed;
 import org.spout.api.util.map.concurrent.AtomicBlockStore;
 import org.spout.api.util.map.concurrent.AtomicBlockStoreImpl;
 import org.spout.api.util.set.TNibbleQuadHashSet;
+
 import org.spout.engine.SpoutConfiguration;
-import org.spout.engine.SpoutEngine;
 import org.spout.engine.entity.SpoutEntity;
 import org.spout.engine.scheduler.SpoutScheduler;
-import org.spout.engine.util.thread.snapshotable.SnapshotManager;
-import org.spout.engine.util.thread.snapshotable.SnapshotableHashMap;
-import org.spout.engine.util.thread.snapshotable.SnapshotableHashSet;
+import org.spout.engine.util.thread.snapshotable.Snapshotable;
+import org.spout.engine.world.physics.PhysicsQueue;
+import org.spout.engine.world.physics.UpdateQueue;
 
-public class SpoutChunk extends Chunk {
-	
-	private static final AtomicInteger activeChunks = new AtomicInteger(0);
-	private static final AtomicInteger observedChunks = new AtomicInteger(0);
-	private final AtomicBoolean observed = new AtomicBoolean(false);
+import com.google.common.collect.Sets;
+
+public class SpoutChunk extends Chunk implements Snapshotable {
+	public static final WeakReference<Chunk> NULL_WEAK_REFERENCE = new WeakReference<Chunk>(null);
+
+	private final Set<SpoutEntity> observers = Sets.newSetFromMap(new ConcurrentHashMap<SpoutEntity, Boolean>());
 	/**
 	 * Multi-thread write access to the block store is only allowed during the
 	 * allowed stages. During the restricted stages, only the region thread may
 	 * modify the block store.
 	 */
 	private static final int restrictedStages = TickStage.PHYSICS | TickStage.DYNAMIC_BLOCKS;
-	private static final int allowedStages = TickStage.STAGE1 | TickStage.STAGE2P | TickStage.TICKSTART | TickStage.GLOBAL_PHYSICS | TickStage.GLOBAL_DYNAMIC_BLOCKS;;
-	private static final int updateStages =
-			TickStage.PHYSICS | TickStage.DYNAMIC_BLOCKS
-			| TickStage.GLOBAL_PHYSICS | TickStage.GLOBAL_DYNAMIC_BLOCKS;
+	private static final int allowedStages = TickStage.STAGE1 | TickStage.STAGE2P | TickStage.TICKSTART | TickStage.GLOBAL_PHYSICS | TickStage.GLOBAL_DYNAMIC_BLOCKS;
+	;
 	/**
 	 * Time in ms between chunk reaper unload checks
 	 */
@@ -127,19 +125,6 @@ public class SpoutChunk extends Chunk {
 	 * Holds if the chunk is populated
 	 */
 	private final AtomicReference<PopulationState> populationState;
-	/**
-	 * Snapshot Manager
-	 */
-	protected final SnapshotManager snapshotManager = new SnapshotManager();
-	/**
-	 * A set of all entities who are observing this chunk
-	 */
-	protected final SnapshotableHashMap<Entity, Integer> observers = new SnapshotableHashMap<Entity, Integer>(snapshotManager);
-	/**
-	 * A set of entities contained in the chunk
-	 */
-	// Hash set should return "dirty" list
-	protected final SnapshotableHashSet<Entity> entities = new SnapshotableHashSet<Entity>(snapshotManager);
 	/**
 	 * Stores a short value of the sky light
 	 * <p/>
@@ -199,13 +184,27 @@ public class SpoutChunk extends Chunk {
 	 * The thread associated with the region
 	 */
 	private final Thread regionThread;
-	private final Thread mainThread;
+
+	/**
+	 * A set of all blocks in this chunk that need a physics update in the next
+	 * tick. The coordinates in this set are relative to the <b>Region</b> containing the
+	 * chunk.
+	 */
+	private final PhysicsQueue physicsQueue;
+
+	private final SpoutScheduler scheduler;
 
 	/**
 	 * A WeakReference to this chunk
 	 */
 	private final WeakReference<Chunk> selfReference;
-	public static final WeakReference<Chunk> NULL_WEAK_REFERENCE = new WeakReference<Chunk>(null);
+
+	/**
+	 * Indicates that the chunk has been added to the dirty queue
+	 */
+	private AtomicBoolean dirtyQueued = new AtomicBoolean(false);
+
+	private AtomicBoolean populationQueued = new AtomicBoolean(false);
 
 	static {
 		for (int i = 0; i < shiftCache.length; i++) {
@@ -242,9 +241,10 @@ public class SpoutChunk extends Chunk {
 			this.datatableMap = extraData;
 		} else {
 			this.datatableMap = new GenericDatatableMap();
-			;
 		}
 		this.dataMap = new DataMap(this.datatableMap);
+
+		physicsQueue = new PhysicsQueue(this);
 
 		column = world.getColumn(this.getBlockX(), this.getBlockZ(), true);
 		column.registerChunk(((int) y) << BLOCKS.BITS);
@@ -254,19 +254,10 @@ public class SpoutChunk extends Chunk {
 		// loaded chunk
 		this.biomes = manager;
 		this.regionThread = region.getExceutionThread();
-		this.mainThread = ((SpoutScheduler) Spout.getScheduler()).getMainThread();
 
-		((SpoutEngine) world.getEngine()).getLeakThread().monitor(this);
-		activeChunks.incrementAndGet();
+		world.getEngine().getLeakThread().monitor(this);
 		selfReference = new WeakReference<Chunk>(this);
-	}
-	
-	public static int getActiveChunks() {
-		return activeChunks.get();
-	}
-	
-	public static int getObservedChunks() {
-		return observedChunks.get();
+		this.scheduler = (SpoutScheduler) Spout.getScheduler();
 	}
 
 	@Override
@@ -321,7 +312,6 @@ public class SpoutChunk extends Chunk {
 			material = blockEvent.getSnapshot().getMaterial();
 			data = blockEvent.getSnapshot().getData();
 		}
-
 
 		short newId = material.getId();
 		short newData = data;
@@ -452,7 +442,7 @@ public class SpoutChunk extends Chunk {
 	public void resetDynamicBlock(int x, int y, int z) {
 		parentRegion.resetDynamicBlock(getBlockX(x), getBlockY(y), getBlockZ(z));
 	}
-	
+
 	@Override
 	public void syncResetDynamicBlock(int x, int y, int z) {
 		parentRegion.syncResetDynamicBlock(getBlockX(x), getBlockY(y), getBlockZ(z));
@@ -584,7 +574,7 @@ public class SpoutChunk extends Chunk {
 	@Override
 	public byte getBlockSkyLight(int x, int y, int z) {
 		int light = this.getBlockSkyLightRaw(x, y, z) - (15 - this.getWorld().getSkyLight());
-		return light < 0 ? (byte)0 : (byte) light;
+		return light < 0 ? (byte) 0 : (byte) light;
 	}
 
 	@Override
@@ -609,7 +599,7 @@ public class SpoutChunk extends Chunk {
 	public void queueBlockPhysics(int x, int y, int z, EffectRange range, Source source) {
 		queueBlockPhysics(x, y, z, range, null, source);
 	}
-		
+
 	public void queueBlockPhysics(int x, int y, int z, EffectRange range, BlockMaterial oldMaterial, Source source) {
 		checkChunkLoaded();
 		int rx = x & BLOCKS.MASK;
@@ -618,13 +608,23 @@ public class SpoutChunk extends Chunk {
 		rx += (getX() & Region.CHUNKS.MASK) << BLOCKS.BITS;
 		ry += (getY() & Region.CHUNKS.MASK) << BLOCKS.BITS;
 		rz += (getZ() & Region.CHUNKS.MASK) << BLOCKS.BITS;
-		this.getRegion().queueBlockPhysics(rx, ry, rz, range, oldMaterial, source);
+		physicsQueue.queueForUpdateAsync(rx, ry, rz, range, oldMaterial, source);
 	}
 
 	@Override
 	public void updateBlockPhysics(int x, int y, int z, Source source) {
+		updateBlockPhysics(x, y, z, null, source);
+	}
+
+	public void updateBlockPhysics(int x, int y, int z, BlockMaterial oldMaterial, Source source) {
 		checkChunkLoaded();
-		this.getRegion().updateBlockPhysics(x, y, z, source);
+		int rx = x & BLOCKS.MASK;
+		int ry = y & BLOCKS.MASK;
+		int rz = z & BLOCKS.MASK;
+		rx += (getX() & Region.CHUNKS.MASK) << BLOCKS.BITS;
+		ry += (getY() & Region.CHUNKS.MASK) << BLOCKS.BITS;
+		rz += (getZ() & Region.CHUNKS.MASK) << BLOCKS.BITS;
+		physicsQueue.queueForUpdate(rx, ry, rz, null, source);
 	}
 
 	private int getBlockIndex(int x, int y, int z) {
@@ -662,7 +662,7 @@ public class SpoutChunk extends Chunk {
 				case UNLOADED:
 					nextState = SaveState.UNLOADED;
 					break;
-				case SAVING: 
+				case SAVING:
 					nextState = SaveState.NONE;
 					break;
 				default:
@@ -755,9 +755,9 @@ public class SpoutChunk extends Chunk {
 			success = saveState.compareAndSet(state, nextState);
 		}
 	}
-	
+
 	public void saveComplete() {
-		if (!observers.isEmptyLive() || observed.get()) {
+		if (isObserved()) {
 			resetPostSaving();
 		} else {
 			saveState.compareAndSet(SaveState.SAVING, SaveState.POST_SAVED);
@@ -795,20 +795,10 @@ public class SpoutChunk extends Chunk {
 					break;
 				default:
 					throw new IllegalStateException("Unknown save state: " + old);
-
 			}
 			success = saveState.compareAndSet(old, nextState);
 		}
 		return old;
-	}
-
-	/**
-	 * @return true if the chunk can be skipped
-	 */
-	public boolean copySnapshotRun() {
-		// NOTE : This is only called for chunks with contain entities.
-		snapshotManager.copyAllSnapshots();
-		return entities.get().isEmpty();
 	}
 
 	// Saves the chunk data - this occurs directly after a snapshot update
@@ -818,7 +808,7 @@ public class SpoutChunk extends Chunk {
 
 	@Override
 	public ChunkSnapshot getSnapshot() {
-		return getSnapshot(SnapshotType.BOTH, EntityType.WEAK_ENTITIES, ExtraData.NO_EXTRA_DATA);
+		return getSnapshot(SnapshotType.BOTH, EntityType.NO_ENTITIES, ExtraData.NO_EXTRA_DATA);
 	}
 
 	@Override
@@ -826,38 +816,39 @@ public class SpoutChunk extends Chunk {
 		checkChunkLoaded();
 		byte[] blockLightCopy = null, skyLightCopy = null;
 		short[] blockIds = null, blockData = null;
-		switch(type) {
-			case NO_BLOCK_DATA: break;
-			case BLOCK_IDS_ONLY: 
+		switch (type) {
+			case NO_BLOCK_DATA:
+				break;
+			case BLOCK_IDS_ONLY:
 				blockIds = blockStore.getBlockIdArray();
 				break;
-			case BLOCKS_ONLY: 
+			case BLOCKS_ONLY:
 				blockIds = blockStore.getBlockIdArray();
 				blockData = blockStore.getDataArray();
 				break;
-			case LIGHT_ONLY: 
+			case LIGHT_ONLY:
 				blockLightCopy = new byte[blockLight.length];
 				System.arraycopy(blockLight, 0, blockLightCopy, 0, blockLight.length);
 				skyLightCopy = new byte[skyLight.length];
 				System.arraycopy(skyLight, 0, skyLightCopy, 0, skyLight.length);
 				break;
-			case BOTH: 
+			case BOTH:
 				blockIds = blockStore.getBlockIdArray();
 				blockData = blockStore.getDataArray();
-				
+
 				blockLightCopy = new byte[blockLight.length];
 				System.arraycopy(blockLight, 0, blockLightCopy, 0, blockLight.length);
 				skyLightCopy = new byte[skyLight.length];
 				System.arraycopy(skyLight, 0, skyLightCopy, 0, skyLight.length);
 				break;
 		}
-		
+
 		return new SpoutChunkSnapshot(this, blockIds, blockData, blockLightCopy, skyLightCopy, entities, data);
 	}
 
 	@Override
 	public Future<ChunkSnapshot> getFutureSnapshot() {
-		return getFutureSnapshot(SnapshotType.BOTH, EntityType.WEAK_ENTITIES, ExtraData.NO_EXTRA_DATA);
+		return getFutureSnapshot(SnapshotType.BOTH, EntityType.NO_ENTITIES, ExtraData.NO_EXTRA_DATA);
 	}
 
 	@Override
@@ -885,26 +876,21 @@ public class SpoutChunk extends Chunk {
 	@Override
 	public boolean refreshObserver(Entity entity) {
 		TickStage.checkStage(TickStage.FINALIZE);
-		if (!entity.isObserver()) {
+		SpoutEntity spoutEntity = ((SpoutEntity) entity);
+		if (!spoutEntity.isObserverLive()) {
 			throw new IllegalArgumentException("Cannot add an entity that isn't marked as an observer!");
 		}
 
 		checkChunkLoaded();
 		parentRegion.unSkipChunk(this);
-		int distance = (int) ((SpoutEntity) entity).getChunkLive().getBase().getDistance(getBase());
-		Integer oldDistance = observers.put(entity, distance);
-		if (oldDistance != null) {
-			// The player was already observing the chunk from distance oldDistance 
-			return false;
-		}
-		resetPostSaving();
 		parentRegion.unloadQueue.remove(this);
 		if (!isPopulated()) {
-			parentRegion.queueChunkForPopulation(this);
+			if (populationQueued.compareAndSet(false, true)) {
+				parentRegion.queueChunkForPopulation(this);
+			}
 		}
-		if (observed.compareAndSet(false, true)) {
-			observedChunks.incrementAndGet();
-		}
+		observers.add((SpoutEntity) entity);
+		resetPostSaving();
 		return true;
 	}
 
@@ -914,35 +900,25 @@ public class SpoutChunk extends Chunk {
 		parentRegion.unSkipChunk(this);
 		TickStage.checkStage(TickStage.FINALIZE);
 
-		Integer oldDistance = observers.remove(entity);
+		Integer oldDistance = ((SpoutEntity) entity).getPrevViewDistance();
 		if (oldDistance == null) {
 			return false;
 		}
 
+		observers.remove((SpoutEntity) entity);
 		if (!isObserved()) {
 			parentRegion.unloadQueue.add(this);
-			if (observed.compareAndSet(true, false)) {
-				observedChunks.decrementAndGet();
-			}
 		}
 		return true;
 	}
 
 	public boolean isObserved() {
-		return !observers.isEmptyLive();
-	}
-
-	public Set<Entity> getObserversLive() {
-		return observers.getLive().keySet();
-	}
-
-	public Set<Entity> getObservers() {
-		return observers.get().keySet();
+		return getNumObservers() > 0;
 	}
 
 	@Override
 	public int getNumObservers() {
-		return observers.getLive().size();
+		return observers.size();
 	}
 
 	public boolean compressIfRequired() {
@@ -975,7 +951,9 @@ public class SpoutChunk extends Chunk {
 	public boolean canSend() {
 		boolean canSend = isPopulated() && !this.isCalculatingLighting();
 		if (!canSend && !isPopulated() && isObserved()) {
-			parentRegion.queueChunkForPopulation(this);
+			if (populationQueued.compareAndSet(false, true)) {
+				parentRegion.queueChunkForPopulation(this);
+			}
 		}
 		return canSend;
 	}
@@ -1011,7 +989,7 @@ public class SpoutChunk extends Chunk {
 		saveState.compareAndSet(SaveState.SAVING, SaveState.NONE);
 		saveState.compareAndSet(SaveState.POST_SAVED, SaveState.NONE);
 	}
-	
+
 	@Override
 	public boolean isLoaded() {
 		return saveState.get() != SaveState.UNLOADED;
@@ -1021,14 +999,14 @@ public class SpoutChunk extends Chunk {
 		TickStage.checkStage(TickStage.SNAPSHOT, regionThread);
 		setUnloadedRaw(true);
 	}
-	
+
 	/**
 	 * This method should only be used for chunks which were unnecessarily loaded
 	 */
 	public void setUnloadedUnchecked() {
 		setUnloadedRaw(false);
 	}
-	
+
 	private void setUnloadedRaw(boolean saveColumn) {
 		SaveState oldState = saveState.getAndSet(SaveState.UNLOADED);
 		//Clear as much as possible to limit the damage of a potential leak
@@ -1036,12 +1014,8 @@ public class SpoutChunk extends Chunk {
 		this.blockLight = null;
 		this.skyLight = null;
 		this.dataMap.clear();
-		if (observed.compareAndSet(true, false)) {
-			observedChunks.decrementAndGet();
-		}
 		if (oldState != SaveState.UNLOADED) {
 			deregisterFromColumn(saveColumn);
-			activeChunks.decrementAndGet();
 		}
 	}
 
@@ -1060,6 +1034,10 @@ public class SpoutChunk extends Chunk {
 		return biomes.getBiome(x & BLOCKS.MASK, y & BLOCKS.MASK, z & BLOCKS.MASK);
 	}
 
+	@Override
+	public void copySnapshot() {
+	}
+
 	public static enum SaveState {
 		UNLOAD_SAVE, UNLOAD, SAVE, NONE, SAVING, POST_SAVED, UNLOADED;
 
@@ -1070,7 +1048,7 @@ public class SpoutChunk extends Chunk {
 		public boolean isUnload() {
 			return this == UNLOAD || this == POST_SAVED;
 		}
-		
+
 		public boolean isPostUnload() {
 			return this == SAVING;
 		}
@@ -1217,6 +1195,16 @@ public class SpoutChunk extends Chunk {
 		populationState.set(state);
 	}
 
+	public void queueForPopulation() {
+		if (populationQueued.compareAndSet(false, true)) {
+			parentRegion.queueChunkForPopulation(this);
+		}
+	}
+
+	public void setNotQueuedForPopulation() {
+		populationQueued.set(false);
+	}
+
 	@Override
 	public void initLighting() {
 		this.isInitializingLighting.set(true);
@@ -1278,169 +1266,26 @@ public class SpoutChunk extends Chunk {
 		this.lightBlockSource = this; // stop using the snapshot from now on
 	}
 
-	public boolean addEntity(SpoutEntity entity) {
-		checkChunkLoaded();
-		TickStage.checkStage(TickStage.FINALIZE);
-		parentRegion.unSkipChunk(this);
-		return entities.add(entity);
-	}
-
-	public boolean removeEntity(SpoutEntity entity) {
-		checkChunkLoaded();
-		TickStage.checkStage(TickStage.FINALIZE);
-		parentRegion.unSkipChunk(this);
-		return entities.remove(entity);
+	@Override
+	public List<Entity> getEntities() {
+		ArrayList<Entity> entities = new ArrayList<Entity>();
+		for (Entity e : parentRegion.getAll()) {
+			if (e.getChunk() == this) {
+				entities.add(e);
+			}
+		}
+		return Collections.unmodifiableList(entities);
 	}
 
 	@Override
-	public Set<Entity> getEntities() {
-		return entities.get();
-	}
-
-	@Override
-	public Set<Entity> getLiveEntities() {
-		return entities.getLive();
-	}
-
-	// Handles network updates for all entities that were
-	// - in the chunk at the last snapshot
-	// - were not in a chunk at the last snapshot and are now in this chunk
-	public void syncEntities() {
-		Map<Entity, Integer> observerSnapshot = observers.get();
-		Map<Entity, Integer> observerLive = observers.getLive();
-
-		Set<Entity> entitiesSnapshot = entities.get();
-		entities.getLive();
-
-		// Changed means entered/left the chunk
-		List<Entity> changedEntities = entities.getDirtyList();
-		List<Entity> changedObservers = observers.getDirtyList();
-
-		if (entitiesSnapshot.size() > 0) {
-			for (Entity p : changedObservers) {
-				Integer playerDistanceOld = observerSnapshot.get(p);
-				if (playerDistanceOld == null) {
-					playerDistanceOld = Integer.MAX_VALUE;
-				}
-				Integer playerDistanceNew = observerLive.get(p);
-				if (playerDistanceNew == null) {
-					playerDistanceNew = Integer.MAX_VALUE;
-				}
-				// Player Network sync
-				if (p.getController() instanceof PlayerController) {
-					Player player = ((PlayerController) p.getController()).getParent();
-
-					NetworkSynchronizer n = player.getNetworkSynchronizer();
-					for (Entity e : entitiesSnapshot) {
-						if (player.equals(e)) {
-							continue;
-						}
-						int entityViewDistanceOld = ((SpoutEntity) e).getPrevViewDistance();
-						int entityViewDistanceNew = e.getViewDistance();
-
-						if (playerDistanceOld <= entityViewDistanceOld && playerDistanceNew > entityViewDistanceNew) {
-							n.destroyEntity(e);
-						} else if (playerDistanceNew <= entityViewDistanceNew && playerDistanceOld > entityViewDistanceOld) {
-							n.spawnEntity(e);
-						}
-					}
-				}
+	public List<Entity> getLiveEntities() {
+		ArrayList<Entity> entities = new ArrayList<Entity>();
+		for (Entity e : parentRegion.getEntityManager().getAllLive()) {
+			if (((SpoutEntity) e).getChunkLive() == this) {
+				entities.add(e);
 			}
 		}
-
-		for (Entity e : changedEntities) {
-			SpoutChunk oldChunk = (SpoutChunk) e.getChunk();
-			if (((SpoutEntity) e).justSpawned()) {
-				oldChunk = null;
-			}
-			SpoutChunk newChunk = (SpoutChunk) ((SpoutEntity) e).getChunkLive();
-			if (!(oldChunk != null && oldChunk.equals(this)) && !((SpoutEntity) e).justSpawned()) {
-				continue;
-			}
-			for (Entity p : observerLive.keySet()) {
-				if (p == null || p.equals(e)) {
-					continue;
-				}
-				if (p.getController() instanceof PlayerController) {
-					Integer playerDistanceOld;
-					if (oldChunk == null) {
-						playerDistanceOld = Integer.MAX_VALUE;
-					} else {
-						playerDistanceOld = oldChunk.observers.getLive().get(p);
-						if (playerDistanceOld == null) {
-							playerDistanceOld = Integer.MAX_VALUE;
-						}
-					}
-					Integer playerDistanceNew;
-					if (newChunk == null) {
-						playerDistanceNew = Integer.MAX_VALUE;
-					} else {
-						playerDistanceNew = newChunk.observers.getLive().get(p);
-						if (playerDistanceNew == null) {
-							playerDistanceNew = Integer.MAX_VALUE;
-						}
-					}
-					int entityViewDistanceOld = ((SpoutEntity) e).getPrevViewDistance();
-					int entityViewDistanceNew = e.getViewDistance();
-
-					Player player = ((PlayerController) p.getController()).getParent();
-
-					if (!player.isOnline()) {
-						continue;
-					}
-					NetworkSynchronizer n = player.getNetworkSynchronizer();
-					if (playerDistanceOld <= entityViewDistanceOld && playerDistanceNew > entityViewDistanceNew) {
-						n.destroyEntity(e);
-					} else if (playerDistanceNew <= entityViewDistanceNew && playerDistanceOld > entityViewDistanceOld) {
-						n.spawnEntity(e);
-					}
-				}
-			}
-		}
-
-		// Update all entities that are in the chunk
-		// TODO - should have sorting based on view distance
-		for (Map.Entry<Entity, Integer> entry : observerLive.entrySet()) {
-			Entity p = entry.getKey();
-			if (p.getController() instanceof PlayerController) {
-				Player player = ((PlayerController) p.getController()).getParent();
-				if (player.isOnline()) {
-					NetworkSynchronizer n = player.getNetworkSynchronizer();
-					int playerDistance = entry.getValue();
-					Entity playerEntity = p;
-					for (Entity e : entitiesSnapshot) {
-						if (playerEntity != e) {
-							if (playerDistance <= e.getViewDistance()) {
-								if (((SpoutEntity) e).getPrevController() != e.getController()) {
-									n.destroyEntity(e);
-									n.spawnEntity(e);
-								}
-								n.syncEntity(e);
-							}
-						}
-					}
-					for (Entity e : changedEntities) {
-						if (entitiesSnapshot.contains(e)) {
-							continue;
-						} else if (((SpoutEntity) e).justSpawned()) {
-							if (playerEntity != e) {
-								if (playerDistance <= e.getViewDistance()) {
-									if (((SpoutEntity) e).getPrevController() != e.getController()) {
-										n.destroyEntity(e);
-										n.spawnEntity(e);
-									}
-									n.syncEntity(e);
-								}
-							}
-						}
-					}
-				}
-			}
-		}
-	}
-
-	public void deregisterFromColumn() {
-		deregisterFromColumn(true);
+		return entities;
 	}
 
 	public void deregisterFromColumn(boolean save) {
@@ -1576,7 +1421,7 @@ public class SpoutChunk extends Chunk {
 	@Override
 	public int addBlockDataField(int bx, int by, int bz, int bits, int value, Source source) {
 		int oldData = addBlockDataFieldRaw(bx, by, bz, bits, value, source);
-		
+
 		int shift = shiftCache[bits];
 
 		return (oldData & bits) >> shift;
@@ -1666,11 +1511,13 @@ public class SpoutChunk extends Chunk {
 	}
 
 	private void blockChanged(int x, int y, int z, BlockMaterial newMaterial, short newData, BlockMaterial oldMaterial, short oldData, Source source) {
+		// Add chunk to regions's dirty queue
+		queueDirty();
+
 		// Handle onPlacement for dynamic materials
 		if (newMaterial instanceof DynamicMaterial) {
 			if (oldMaterial instanceof BlockMaterial) {
-				BlockMaterial oldBlockMaterial = (BlockMaterial) oldMaterial;
-				if (!oldBlockMaterial.isCompatibleWith(newMaterial) || !newMaterial.isCompatibleWith(oldBlockMaterial)) {
+				if (!oldMaterial.isCompatibleWith(newMaterial) || !newMaterial.isCompatibleWith(oldMaterial)) {
 					parentRegion.resetDynamicBlock(x, y, z);
 				}
 			} else {
@@ -1702,8 +1549,85 @@ public class SpoutChunk extends Chunk {
 	public BiomeManager getBiomeManager() {
 		return biomes;
 	}
-	
+
 	public WeakReference<Chunk> getWeakReference() {
 		return selfReference;
 	}
+
+	public void setNotDirtyQueued() {
+		dirtyQueued.set(false);
+	}
+
+	private void queueDirty() {
+		if (dirtyQueued.compareAndSet(false, true)) {
+			parentRegion.queueDirty(this);
+		}
+	}
+
+	public void setInactivePhysics(boolean local) {
+		physicsQueue.setInactive(local);
+	}
+
+	int physicsUpdates = 0;
+
+	public boolean runLocalPhysics() {
+		scheduler.addUpdates(physicsUpdates);
+		physicsUpdates = 0;
+		SpoutWorld world = getWorld();
+
+		boolean updated = false;
+		updated |= physicsQueue.commitAsyncQueue();
+		if (updated) {
+			scheduler.addUpdates(1);
+		}
+
+		UpdateQueue queue = physicsQueue.getUpdateQueue();
+
+		while (queue.hasNext()) {
+			int x = queue.getX();
+			int y = queue.getY();
+			int z = queue.getZ();
+			Source source = queue.getSource();
+			BlockMaterial oldMaterial = queue.getOldMaterial();
+			if (!callOnUpdatePhysicsForRange(world, x, y, z, oldMaterial, source, false)) {
+				physicsQueue.queueForUpdateMultiRegion(x, y, z, oldMaterial, source);
+			}
+		}
+		return updated;
+	}
+
+	public void runGlobalPhysics() {
+		scheduler.addUpdates(physicsUpdates);
+		physicsUpdates = 0;
+		SpoutWorld world = getWorld();
+
+		UpdateQueue queue = physicsQueue.getMultiRegionQueue();
+
+		while (queue.hasNext()) {
+			int x = queue.getX();
+			int y = queue.getY();
+			int z = queue.getZ();
+			Source source = queue.getSource();
+			BlockMaterial oldMaterial = queue.getOldMaterial();
+			callOnUpdatePhysicsForRange(world, x, y, z, oldMaterial, source, true);
+		}
+	}
+
+	private boolean callOnUpdatePhysicsForRange(World world, int x, int y, int z, BlockMaterial oldMaterial, Source source, boolean force) {
+		int packed = getBlockFullState(x, y, z);
+		BlockMaterial material = BlockFullState.getMaterial(packed);
+		if (material.hasPhysics()) {
+			short data = BlockFullState.getData(packed);
+			if (!force && !material.getMaximumPhysicsRange(data).isRegionLocal(x, y, z)) {
+				return false;
+			}
+			//switch region block coords (0-255) to world block coords
+			SpoutRegion region = getRegion();
+			Block block = world.getBlock(x + region.getBlockX(), y + region.getBlockY(), z + region.getBlockZ(), source);
+			block.getMaterial().onUpdate(oldMaterial, block);
+			physicsUpdates++;
+		}
+		return true;
+	}
+
 }

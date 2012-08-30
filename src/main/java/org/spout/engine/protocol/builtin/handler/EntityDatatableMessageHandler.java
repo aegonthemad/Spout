@@ -24,31 +24,25 @@
  * License and see <http://www.spout.org/SpoutDevLicenseV1.txt> for the full license,
  * including the MIT license.
  */
-package org.spout.engine.entity;
+package org.spout.engine.protocol.builtin.handler;
 
-import org.spout.engine.world.SpoutRegion;
+import org.spout.api.entity.Entity;
+import org.spout.api.protocol.ClientMessageHandler;
+import org.spout.api.protocol.Session;
+import org.spout.api.protocol.builtin.message.EntityDatatableMessage;
 
-public final class RegionEntityManager extends EntityManager{
-	private final SpoutRegion region;
-	public RegionEntityManager(SpoutRegion region) {
-		super();
-		if (region == null) throw new NullPointerException("Region can not be null!");
-		this.region = region;
-	}
-	
+/**
+ * 
+ */
+public class EntityDatatableMessageHandler implements ClientMessageHandler<EntityDatatableMessage> {
 	@Override
-	public int allocate(SpoutEntity entity) {
-		return allocate(entity, region);
-	}
-	
-	/**
-	 * The region this entity manager oversees
-	 * 
-	 * @return region
-	 */
-	@Override
-	public final SpoutRegion getRegion() {
-		return region;
-	}
+	public void handle(Session session, EntityDatatableMessage message) {
+		if(!session.hasPlayer()) {
+			return;
+		}
 
+		Entity entity = session.getPlayer().getWorld().getEntity(message.getEntityId());
+		// TODO: Give datatable access to packet
+		//entity.getController().data().decompress(message.getCompressedData());
+	}
 }

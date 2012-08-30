@@ -26,19 +26,19 @@
  */
 package org.spout.engine.protocol;
 
+import java.util.List;
+
 import org.jboss.netty.channel.Channel;
 import org.jboss.netty.channel.ChannelFutureListener;
 import org.spout.api.chat.ChatArguments;
 import org.spout.api.chat.style.ChatStyle;
-import org.spout.api.entity.Entity;
 import org.spout.api.event.player.PlayerKickEvent;
 import org.spout.api.event.player.PlayerLeaveEvent;
 import org.spout.api.event.storage.PlayerSaveEvent;
 import org.spout.api.protocol.Message;
 import org.spout.api.protocol.Protocol;
 import org.spout.engine.SpoutServer;
-import org.spout.engine.player.SpoutPlayer;
-import org.spout.engine.world.SpoutWorld;
+import org.spout.engine.entity.SpoutPlayer;
 
 /**
  * SpoutSession for servers
@@ -71,7 +71,8 @@ public class SpoutServerSession<T extends SpoutServer> extends SpoutSession<T> {
 				if (event.isCancelled()) {
 					return false;
 				}
-				reason = ((PlayerKickEvent) event).getKickReason();
+				List<Object> args = ((PlayerKickEvent) event).getKickReason().getArguments();
+				reason = args.toArray(new Object[args.size()]);
 				getEngine().getCommandSource().sendMessage("Player ", getPlayer().getName(), " kicked: ", reason);
 			} else {
 				event = new PlayerLeaveEvent(getPlayer(), getDefaultLeaveMessage());
@@ -103,8 +104,8 @@ public class SpoutServerSession<T extends SpoutServer> extends SpoutSession<T> {
 				getEngine().getEventManager().callEvent(leaveEvent);
 			}
 
-			Object[] text = leaveEvent.getMessage();
-			if (text != null && text.length > 0) {
+			ChatArguments text = leaveEvent.getMessage();
+			if (text != null && text.getArguments().size() > 0) {
 				getEngine().broadcastMessage(text);
 			}
 

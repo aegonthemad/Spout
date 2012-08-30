@@ -26,10 +26,13 @@
  */
 package org.spout.engine;
 
+import static org.spout.api.lang.Translation.log;
+
 import java.net.InetAddress;
 import java.net.SocketAddress;
 import java.net.UnknownHostException;
 import java.util.ArrayList;
+import java.util.Arrays;
 import java.util.Collection;
 import java.util.Collections;
 import java.util.List;
@@ -44,22 +47,28 @@ import org.jboss.netty.channel.Channel;
 import org.jboss.netty.channel.ChannelFactory;
 import org.jboss.netty.channel.ChannelPipelineFactory;
 import org.spout.api.Server;
+import org.spout.api.chat.ChatArguments;
+import org.spout.api.command.CommandSource;
+import org.spout.api.entity.Player;
 import org.spout.api.event.Listener;
 import org.spout.api.event.server.ServerStartEvent;
+import org.spout.api.event.server.ServerStopEvent;
 import org.spout.api.exception.ConfigurationException;
+import org.spout.api.permissions.PermissionsSubject;
 import org.spout.api.plugin.Platform;
 import org.spout.api.protocol.CommonPipelineFactory;
 import org.spout.api.protocol.PortBinding;
 import org.spout.api.protocol.Protocol;
 import org.spout.api.protocol.Session;
-import org.spout.api.protocol.builtin.SpoutServerProtocol;
+import org.spout.api.util.StringUtil;
+import org.spout.api.util.ban.BanManager;
+import org.spout.engine.entity.SpoutPlayer;
 import org.spout.engine.filesystem.ServerFileSystem;
 import org.spout.engine.listener.SpoutServerListener;
 import org.spout.engine.protocol.PortBindingImpl;
 import org.spout.engine.protocol.PortBindings;
 import org.spout.engine.protocol.SpoutNioServerSocketChannel;
 import org.spout.engine.protocol.SpoutServerSession;
-import org.spout.engine.util.bans.BanManager;
 import org.spout.engine.util.bans.FlatFileBanManager;
 import org.spout.engine.util.thread.threadfactory.NamedThreadFactory;
 import org.teleal.cling.UpnpService;
@@ -67,6 +76,7 @@ import org.teleal.cling.UpnpServiceImpl;
 import org.teleal.cling.controlpoint.ControlPoint;
 import org.teleal.cling.support.igd.PortMappingListener;
 import org.teleal.cling.support.model.PortMapping;
+import org.teleal.cling.transport.spi.InitializationException;
 
 public class SpoutServer extends SpoutEngine implements Server {
 	private final String name = "Spout Server";
@@ -104,7 +114,6 @@ public class SpoutServer extends SpoutEngine implements Server {
 	@Override
 	public void start() {
 		start(true);
-		Protocol.registerProtocol(new SpoutServerProtocol());
 	}
 
 	@Override
@@ -115,12 +124,12 @@ public class SpoutServer extends SpoutEngine implements Server {
 	public void start(boolean checkWorlds, Listener listener) {
 		super.start(checkWorlds);
 
-		banManager = new FlatFileBanManager(this);
+		banManager = new FlatFileBanManager();
 
 		getEventManager().registerEvents(listener, this);
 		getFilesystem().postStartup();
 		getEventManager().callEvent(new ServerStartEvent());
-		getLogger().info("Done Loading, ready for players.");
+		log("Done Loading, ready for players.");
 	}
 
 	@Override
@@ -131,11 +140,11 @@ public class SpoutServer extends SpoutEngine implements Server {
 			portBindings.bindAll();
 			portBindings.save();
 		} catch (ConfigurationException e) {
-			getLogger().log(Level.SEVERE, "Error loading port bindings: " + e.getMessage(), e);
+			log("Error loading port bindings: %0", Level.SEVERE, e);
 		}
 
 		if (boundProtocols.size() == 0) {
-			getLogger().warning("No port bindings registered! Clients will not be able to connect to the server.");
+			log("No port bindings registered! Clients will not be able to connect to the server.", Level.WARNING);
 		}
 	}
 
@@ -155,12 +164,15 @@ public class SpoutServer extends SpoutEngine implements Server {
 	}
 
 	@Override
-	public boolean stop(String message) {
-		if (!super.stop(message, false)) {
-			return false;
-		}
+	public boolean stop(final String message) {
 		Runnable finalTask = new Runnable() {
 			public void run() {
+				for (Player player : getOnlinePlayers()) {
+					ServerStopEvent stopEvent = new ServerStopEvent(message);
+					getEventManager().callEvent(stopEvent);
+					player.kick(stopEvent.getMessage());
+				}
+
 				if (upnpService != null) {
 					upnpService.shutdown();
 				}
@@ -170,7 +182,7 @@ public class SpoutServer extends SpoutEngine implements Server {
 		};
 		scheduler.submitFinalTask(finalTask);
 		scheduler.stop(1);
-		return true;
+		return super.stop(message);
 	}
 
 	@Override
@@ -187,12 +199,133 @@ public class SpoutServer extends SpoutEngine implements Server {
 		try {
 			group.add(bootstrap.bind(binding.getAddress()));
 		} catch (org.jboss.netty.channel.ChannelException ex) {
-			getLogger().log(Level.SEVERE, "Failed to bind to address " + binding.getAddress() + ". Is there already another server running on this address?", ex);
+			log("Failed to bind to address %0. Is there already another server running on this address?", Level.SEVERE, binding.getAddress(), ex);
 			return false;
 		}
 
-		getLogger().log(Level.INFO, "Binding to address: {0}...", binding.getAddress());
+		log("Binding to address: %0...", binding.getAddress());
 		return true;
+	}
+
+	@Override
+	public void banPlayer(String player) {
+		banPlayer(player, true);
+	}
+
+	@Override
+	public void banPlayer(String player, boolean kick) {
+		banPlayer(player, kick, null);
+	}
+
+	@Override
+	public void banPlayer(String player, boolean kick, Object... reason) {
+		Player p = getPlayer(player, true);
+		if (kick && p != null) {
+			if (reason == null) {
+				p.kick();
+			} else {
+				p.kick(reason);
+			}
+		}
+		banManager.setBanned(player, true);
+	}
+
+	@Override
+	public void banPlayer(Player player) {
+		banPlayer(player, true);
+	}
+
+	@Override
+	public void banPlayer(Player player, boolean kick) {
+		banPlayer(player, kick, null);
+	}
+
+	@Override
+	public void banPlayer(Player player, boolean kick, Object... reason) {
+		if (kick) {
+			if (reason == null) {
+				player.kick();
+			} else {
+				player.kick(reason);
+			}
+		}
+		banManager.setBanned(player.getName(), true);
+	}
+
+	@Override
+	public void unbanPlayer(String player) {
+		banManager.setBanned(player, false);
+	}
+
+	@Override
+	public void banIp(String address) {
+		banIp(address, true);
+	}
+
+	@Override
+	public void banIp(String address, boolean kick) {
+		banIp(address, kick, null);
+	}
+
+	@Override
+	public void banIp(String address, boolean kick, Object... reason) {
+		if (kick) {
+			for (Player player : getOnlinePlayers()) {
+				if (player.getAddress().getHostAddress().equals(address)) {
+					if (reason == null) {
+						player.kick();
+					} else {
+						player.kick(reason);
+					}
+				}
+			}
+		}
+		banManager.setIpBanned(address, true);
+	}
+
+	@Override
+	public void unbanIp(String address) {
+		banManager.setIpBanned(address, false);
+	}
+
+	@Override
+	public Collection<String> getBannedIps() {
+		return banManager.getBannedIps();
+	}
+
+	@Override
+	public Collection<String> getBannedPlayers() {
+		return banManager.getBannedPlayers();
+	}
+
+	@Override
+	public boolean isBanned(String player) {
+		return banManager.isBanned(player);
+	}
+
+	@Override
+	public boolean isIpBanned(String address) {
+		return banManager.isIpBanned(address);
+	}
+
+	@Override
+	public ChatArguments getBanMessage() {
+		return banManager.getBanMessage();
+	}
+
+	@Override
+	public void setBanMessage(Object... message) {
+		banManager.setBanMessage(message);
+	}
+
+	@Override
+	public ChatArguments getIpBanMessage() {
+		return banManager.getIpBanMessage();
+	}
+
+	@Override
+	public void setIpBanMessage(Object... message) {
+		banManager.setIpBanMessage(message);
 	}
 
 	@Override
@@ -266,61 +399,6 @@ public class SpoutServer extends SpoutEngine implements Server {
 	}
 
 	@Override
-	public Collection<String> getIPBans() {
-		return banManager.getIpBans();
-	}
-
-	@Override
-	public void banIP(String address) {
-		banManager.setIpBanned(address, true);
-	}
-
-	@Override
-	public void unbanIP(String address) {
-		banManager.setIpBanned(address, false);
-	}
-
-	@Override
-	public void banPlayer(String player) {
-		banManager.setBanned(player, true);
-	}
-
-	@Override
-	public void unbanPlayer(String player) {
-		banManager.setBanned(player, false);
-	}
-
-	@Override
-	public boolean isBanned(String player, String address) {
-		return banManager.isBanned(player, address);
-	}
-
-	@Override
-	public boolean isIPBanned(String address) {
-		return banManager.isIpBanned(address);
-	}
-
-	@Override
-	public boolean isPlayerBanned(String player) {
-		return banManager.isBanned(player);
-	}
-
-	@Override
-	public String getBanMessage(String player) {
-		return banManager.getBanMessage(player);
-	}
-
-	@Override
-	public String getIPBanMessage(String address) {
-		return banManager.getIpBanMessage(address);
-	}
-
-	@Override
-	public Collection<String> getBannedPlayers() {
-		return banManager.getBans();
-	}
-
-	@Override
 	public Session newSession(Channel channel) {
 		Protocol protocol = getProtocol(channel.getLocalAddress());
 		return new SpoutServerSession<SpoutServer>(this, channel, protocol);
@@ -338,7 +416,11 @@ public class SpoutServer extends SpoutEngine implements Server {
 
 	private UpnpService getUPnPService() {
 		if (upnpService == null) {
-			upnpService = new UpnpServiceImpl();
+			try {
+				upnpService = new UpnpServiceImpl();
+			} catch (InitializationException e) {
+				log("Could not enable UPnP Service: %0", Level.SEVERE, e.getMessage());
+			}
 		}
 
 		return upnpService;
@@ -361,12 +443,15 @@ public class SpoutServer extends SpoutEngine implements Server {
 
 	@Override
 	public void mapUPnPPort(int port, String description) {
-		PortMapping[] desiredMapping = {createPortMapping(port, PortMapping.Protocol.TCP, description), createPortMapping(port, PortMapping.Protocol.UDP, description)};
-		PortMappingListener listener = new PortMappingListener(desiredMapping);
+		UpnpService upnpService = getUPnPService();
+		if (upnpService != null) {
+			PortMapping[] desiredMapping = {createPortMapping(port, PortMapping.Protocol.TCP, description), createPortMapping(port, PortMapping.Protocol.UDP, description)};
+			PortMappingListener listener = new PortMappingListener(desiredMapping);
 
-		ControlPoint controlPoint = getUPnPService().getControlPoint();
-		controlPoint.getRegistry().addListener(listener);
-		controlPoint.search();
+			ControlPoint controlPoint = upnpService.getControlPoint();
+			controlPoint.getRegistry().addListener(listener);
+			controlPoint.search();
+		}
 	}
 
 	@Override
@@ -397,5 +482,58 @@ public class SpoutServer extends SpoutEngine implements Server {
 		ControlPoint controlPoint = getUPnPService().getControlPoint();
 		controlPoint.getRegistry().addListener(listener);
 		controlPoint.search();
+	}
+
+	@Override
+	public List<String> getAllPlayers() {
+		// TODO Auto-generated method stub
+		return null;
+	}
+
+	@Override
+	public SpoutPlayer[] getOnlinePlayers() {
+		Map<String, SpoutPlayer> playerList = onlinePlayers.get();
+		ArrayList<SpoutPlayer> onlinePlayers = new ArrayList<SpoutPlayer>(playerList.size());
+		for (SpoutPlayer player : playerList.values()) {
+			if (player.isOnline()) {
+				onlinePlayers.add(player);
+			}
+		}
+		return onlinePlayers.toArray(new SpoutPlayer[onlinePlayers.size()]);
+	}
+
+	@Override
+	public void broadcastMessage(Object... message) {
+		broadcastMessage(STANDARD_BROADCAST_PERMISSION, message);
+	}
+
+	@Override
+	public void broadcastMessage(String permission, Object... message) {
+		ChatArguments args = new ChatArguments(message);
+		for (PermissionsSubject player : getAllWithNode(permission)) {
+			if (player instanceof CommandSource) {
+				((CommandSource) player).sendMessage(args);
+			}
+		}
+	}
+
+	@Override
+	public Player getPlayer(String name, boolean exact) {
+		name = name.toLowerCase();
+		if (exact) {
+			for (Player player : onlinePlayers.getValues()) {
+				if (player.getName().equalsIgnoreCase(name)) {
+					return player;
+				}
+			}
+			return null;
+		} else {
+			return StringUtil.getShortest(StringUtil.matchName(onlinePlayers.getValues(), name));
+		}
+	}
+
+	@Override
+	public Collection<Player> matchPlayer(String name) {
+		return StringUtil.matchName(Arrays.<Player>asList(getOnlinePlayers()), name);
 	}
 }
