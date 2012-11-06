@@ -133,7 +133,7 @@ public class SpoutInput implements Input {
 
 		KeyEvent event;
 		// Handle keyboard
-		Keyboard.doEventCheck();
+		//Keyboard.doEventCheck();
 		while ((event = Keyboard.nextEvent()) != null) {
 			doKeypress(event.getKey(), event.isPressed());
 		}
